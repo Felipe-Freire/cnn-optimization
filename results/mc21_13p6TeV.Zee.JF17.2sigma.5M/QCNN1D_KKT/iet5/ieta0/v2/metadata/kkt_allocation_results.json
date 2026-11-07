@@ -1,0 +1,16 @@
+{
+  "lambda_optimal": 0.0001601486692924937,
+  "continuous_bits": {
+    "conv1d_1": 3.43485739596604,
+    "dense_1": 5.866875615248138,
+    "output_dense": 4.765636200386551
+  },
+  "integer_bits": {
+    "conv1d_1": 3,
+    "dense_1": 6,
+    "output_dense": 8
+  },
+  "achieved_bops": 51776.0,
+  "budget_bops": 52838.4,
+  "budget_active": true
+}
