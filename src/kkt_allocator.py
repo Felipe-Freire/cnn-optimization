@@ -30,15 +30,18 @@ def compute_hutchinson_hessian_trace(
         Dictionary mapping layer name to its estimated Hessian trace Tr(H_i).
     """
     np.random.seed(seed)
-    trainable_vars = [v for v in model.trainable_variables if "kernel" in v.name]
-    var_traces = {v.name.split("/")[0]: 0.0 for v in trainable_vars}
+    # Identify layers that contain a trainable kernel weight
+    target_layers = [l for l in model.layers if hasattr(l, "kernel") and l.kernel is not None]
+    trainable_vars = [l.kernel for l in target_layers]
+    layer_names = [l.name for l in target_layers]
+    var_traces = {name: 0.0 for name in layer_names}
 
     for _ in range(num_hvp):
         # Generate random Rademacher vector for each trainable kernel
-        v_dict = {}
+        v_list = []
         for var in trainable_vars:
             rademacher = np.random.choice([-1.0, 1.0], size=var.shape).astype(np.float32)
-            v_dict[var.name] = tf.convert_to_tensor(rademacher)
+            v_list.append(tf.convert_to_tensor(rademacher))
 
         with tf.GradientTape() as outer_tape:
             with tf.GradientTape() as inner_tape:
@@ -49,18 +52,17 @@ def compute_hutchinson_hessian_trace(
             grads = inner_tape.gradient(loss, trainable_vars)
 
             # Inner product between grad and random vector: sum_i (g_i * v_i)
-            gv_products = [tf.reduce_sum(g * v_dict[var.name]) for g, var in zip(grads, trainable_vars) if g is not None]
+            gv_products = [tf.reduce_sum(g * v) for g, v in zip(grads, v_list) if g is not None]
             total_gv = tf.add_n(gv_products)
 
         # Second gradient: H * v = grad(total_gv, W)
         hvps = outer_tape.gradient(total_gv, trainable_vars)
 
-        for var, hvp in zip(trainable_vars, hvps):
+        for name, v, hvp in zip(layer_names, v_list, hvps):
             if hvp is not None:
-                layer_name = var.name.split("/")[0]
                 # v^T * (H * v)
-                quad_form = tf.reduce_sum(v_dict[var.name] * hvp).numpy()
-                var_traces[layer_name] += float(quad_form) / num_hvp
+                quad_form = tf.reduce_sum(v * hvp).numpy()
+                var_traces[name] += float(quad_form) / num_hvp
 
     # Ensure non-negative trace estimates
     return {k: max(1e-8, v) for k, v in var_traces.items()}
@@ -81,8 +83,8 @@ def compute_layer_c_coefficients(
     """
     c_coeffs = {}
     for layer in model.layers:
-        if layer.name in traces:
-            weights = layer.get_weights()[0]  # kernel
+        if layer.name in traces and hasattr(layer, "kernel") and layer.kernel is not None:
+            weights = layer.kernel.numpy()
             n_i = weights.size
             r_i = float(np.max(np.abs(weights))) + 1e-6
             tr_h = traces[layer.name]
@@ -180,13 +182,10 @@ def solve_kkt_bit_allocation(
     optimal_continuous_b = get_bits(lam_mid)
 
     # Discretization: Greedy integer rounding respecting budget
-    # Initial floor rounding
     floor_b = np.floor(optimal_continuous_b).astype(int)
     floor_b = np.clip(floor_b, b_min, b_max)
     current_bops = np.sum(a * floor_b)
 
-    # Greedily allocate remaining budget to layers offering highest loss reduction per BOP:
-    # d(Loss) = c_i * (4^(-b_i) - 4^(-(b_i+1)))
     integer_b = floor_b.copy()
     while True:
         best_layer = -1

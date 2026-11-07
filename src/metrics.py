@@ -1,10 +1,13 @@
 """Metrics and callbacks for ATLAS L0 Ringer optimization."""
 
+import os
+os.environ["TF_USE_LEGACY_KERAS"] = "1"
 from typing import Dict, Optional, Tuple
 import numpy as np
 from sklearn.metrics import roc_curve
 import tensorflow as tf
-from tensorflow.keras.callbacks import Callback
+import tf_keras as keras
+from tf_keras.callbacks import Callback
 
 
 def norm1(data: np.ndarray) -> np.ndarray:
