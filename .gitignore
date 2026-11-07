@@ -69,11 +69,15 @@ dmypy.json
 *.keras
 *.tflite
 *.onnx
+*.npz
+*.pkl
 checkpoints/
 logs/
 tensorboard/
 *_tuner/
 keras_tuner/
+results/training_results_*.json
+results/figures/
 
 # Environment variables & secrets
 .env
