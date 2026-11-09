@@ -1,0 +1,156 @@
+{
+  "timestamp": "2026-11-08T22:10:26.156630",
+  "dataset_prefix": "mc21_13p6TeV.Zee.JF17.2sigma.5M",
+  "model_name": "QCNN1D_KKT",
+  "iet": 5,
+  "ieta": 0,
+  "version": 2,
+  "seed": 42,
+  "git_commit": "c2a1ffb29cf7a17c51a2c175919f323d87eca017",
+  "python_version": "3.11.18",
+  "tensorflow_version": "2.20.0",
+  "extra_config": {
+    "rings_structure": {
+      "PS": 2,
+      "EM1": 16,
+      "EM2": 2,
+      "EM3": 2,
+      "HAD1": 1,
+      "HAD2": 1,
+      "HAD3": 1
+    },
+    "vu13p_chip_limits": {
+      "DSP": 12288.0,
+      "LUT": 1728000.0,
+      "FF": 3456000.0,
+      "BRAM_bits": 99090432.0
+    },
+    "vu13p_instance_budget": {
+      "DSP": 0.0,
+      "LUT": 2500.0,
+      "FF": 10000.0,
+      "BRAM_bits": 5500.0
+    },
+    "hardware_fp32": {
+      "total_macs": 1376,
+      "total_bops": 88064,
+      "total_weight_bits": 6536,
+      "total_params": 817,
+      "vu13p_resources": {
+        "DSP": 0.0,
+        "LUT": 4892.444444444444,
+        "FF": 7224.0,
+        "BRAM_bits": 6536.0
+      },
+      "breakdown": [
+        {
+          "layer_name": "conv1d_1",
+          "layer_type": "Conv1D",
+          "units": 8,
+          "macs": 600,
+          "b_w": 8,
+          "b_a": 8,
+          "bops": 38400,
+          "params": 32,
+          "DSP": 0.0,
+          "LUT": 2133.3333333333335,
+          "FF": 556.0,
+          "BRAM_bits": 256.0
+        },
+        {
+          "layer_name": "dense_1",
+          "layer_type": "Dense",
+          "units": 8,
+          "macs": 768,
+          "b_w": 8,
+          "b_a": 8,
+          "bops": 49152,
+          "params": 776,
+          "DSP": 0.0,
+          "LUT": 2730.6666666666665,
+          "FF": 6592.0,
+          "BRAM_bits": 6208.0
+        },
+        {
+          "layer_name": "output_dense",
+          "layer_type": "Dense",
+          "units": 1,
+          "macs": 8,
+          "b_w": 8,
+          "b_a": 8,
+          "bops": 512,
+          "params": 9,
+          "DSP": 0.0,
+          "LUT": 28.444444444444443,
+          "FF": 76.0,
+          "BRAM_bits": 72.0
+        }
+      ]
+    },
+    "hardware_qkeras_kkt": {
+      "total_macs": 1376,
+      "total_bops": 42560,
+      "total_weight_bits": 4824,
+      "total_params": 817,
+      "vu13p_resources": {
+        "DSP": 0.0,
+        "LUT": 2364.4444444444443,
+        "FF": 5416.0,
+        "BRAM_bits": 4824.0
+      },
+      "breakdown": [
+        {
+          "layer_name": "conv1d_1",
+          "layer_type": "QConv1D",
+          "units": 8,
+          "macs": 600,
+          "b_w": 3,
+          "b_a": 8,
+          "bops": 14400,
+          "params": 32,
+          "DSP": 0.0,
+          "LUT": 800.0,
+          "FF": 396.0,
+          "BRAM_bits": 96.0
+        },
+        {
+          "layer_name": "dense_1",
+          "layer_type": "QDense",
+          "units": 8,
+          "macs": 768,
+          "b_w": 6,
+          "b_a": 6,
+          "bops": 27648,
+          "params": 776,
+          "DSP": 0.0,
+          "LUT": 1536.0,
+          "FF": 4944.0,
+          "BRAM_bits": 4656.0
+        },
+        {
+          "layer_name": "output_dense",
+          "layer_type": "QDense",
+          "units": 1,
+          "macs": 8,
+          "b_w": 8,
+          "b_a": 8,
+          "bops": 512,
+          "params": 9,
+          "DSP": 0.0,
+          "LUT": 28.444444444444443,
+          "FF": 76.0,
+          "BRAM_bits": 72.0
+        }
+      ]
+    },
+    "holdout_metrics": {
+      "sp": 0.9652406980805953,
+      "pd": 0.9826267340853105,
+      "fa": 0.05199014650589913,
+      "threshold": 0.7872776985168457,
+      "fp32_sp": 0.9758559134853121,
+      "fp32_pd": 0.9865162712303902,
+      "fp32_fa": 0.03474653182937897
+    }
+  }
+}
