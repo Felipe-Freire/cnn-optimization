@@ -157,9 +157,82 @@ $$h(\lambda) = \sum_i a_i b_i^*(\lambda) - B$$
 
 ---
 
-## 4. Otimização Bi-Objetivo de Hiperparâmetros (Pareto & TPE)
+## 4. Formulação Primal-Dual Restrita para o FPGA Xilinx Virtex UltraScale+ VU13P
 
-### 4.1 Abordagem 1: Busca Black-Box com Penalidade Exterior (TPE)
+No contexto real de operação do trigger de Nível 0 (L0) do experimento ATLAS no HL-LHC, as placas de processamento de sinais (como a plataforma Global Common Module - GCM) utilizam FPGAs da família **AMD/Xilinx Virtex UltraScale+ VU13P**.
+
+Conforme a **Tabela 15 (*Virtex UltraScale+ FPGA Feature Summary*)** da documentação oficial da AMD/Xilinx, a capacidade total do dispositivo ($\mathbf{B}_{\text{chip}}$) e o orçamento fracionário dedicado a uma instância individual do classificador Ringer ($B_j = \alpha_j \cdot B_{j, \text{chip}}$, onde $\alpha_j \in (0, 1]$ representa a fração de área/recursos alocada ao núcleo neural) são definidos por:
+
+| Recurso Físico ($j$) | Capacidade Total da VU13P ($B_{j, \text{chip}}$) | Modelo de Consumo por Camada $l \in \{1, \dots, L\}$ |
+| :--- | :--- | :--- |
+| **DSP Slices** (`DSP`) | $12.288\text{ slices}$ | $\text{DSP}_l(w_l, a_l, n_l)$ — Alocado quando $w_l > 8$ ou $a_l > 8$ |
+| **CLB LUTs** (`LUT`) | $1.728.000\text{ LUTs}$ | $\text{LUT}_l(w_l, a_l, n_l) \approx \text{MAC}_l \cdot \frac{w_l \cdot a_l}{18}$ (quando $w_l \le 8, a_l \le 8$) |
+| **CLB Flip-Flops** (`FF`) | $3.456.000\text{ FFs}$ | $\text{FF}_l(w_l, a_l, n_l) \approx P_l \cdot w_l + N_{\text{out}, l} \cdot a_l$ |
+| **Block RAM** (`BRAM`) | $94,5\text{ Mb}$ ($2.688 \times 36\text{ Kb}$) | $\text{Bits}_l(w_l, n_l) = P_l \cdot w_l$ |
+| **UltraRAM** (`URAM`) | $360,0\text{ Mb}$ ($1.280 \times 288\text{ Kb}$) | Memória massiva unificada ($B_{\text{Mem}} = B_{\text{BRAM}} + B_{\text{URAM}}$) |
+
+### 4.1 Variáveis de Decisão e Função Objetivo Baseada no Índice-SP Existente
+
+Para cada camada $l \in \{1, \dots, L\}$ da arquitetura `QConv1D` / `QDense`:
+- $w_l \in \{1, 2, 4, 6, 8, 16\}$: Largura de bits dos pesos e vieses (*weights/biases*);
+- $a_l \in \{1, 2, 4, 6, 8, 16\}$: Largura de bits das ativações (*activations*);
+- $n_l \in \mathbb{Z}^+$: Número de filtros convolucionais 1D ou neurônios densos.
+
+Mantendo o **Índice Soma-Produto ($SP$)** padrão do ATLAS Ringer avaliado no joelho (*knee*) da curva ROC (Equação da Seção 1.1):
+
+$$SP_{\text{val}}(\mathbf{x}) = \max_{\tau} \sqrt{\sqrt{PD(\tau) \cdot (1 - FA(\tau))} \cdot \left[ \frac{PD(\tau) + (1 - FA(\tau))}{2} \right]}$$
+
+definimos a função objetivo primal a ser minimizada como o complementar do Índice-$SP$:
+
+$$f(\mathbf{x}) = \mathcal{L}_{\text{SP}}(\mathbf{x}) = 1 - SP_{\text{val}}(\mathbf{x})$$
+
+### 4.2 Vetor de Restrições de Desigualdade de Hardware ($\mathbf{g}(\mathbf{x}) \le \mathbf{0}$)
+
+Para o conjunto de recursos $\mathcal{R} = \{\text{DSP}, \text{LUT}, \text{FF}, \text{BRAM\_bits}\}$, cada restrição de orçamento $B_j$ é expressa na forma canônica $g_j(\mathbf{x}) \le 0$ (ou na forma normalizada adimensional $\tilde{g}_j(\mathbf{x}) = \frac{R_j(\mathbf{x}) - B_j}{B_j} \le 0$ para estabilidade numérica dos multiplicadores):
+
+1. **Restrição de DSPs**:
+   $$g_{\text{DSP}}(\mathbf{x}) = \sum_{l=1}^L \text{DSP}_l(w_l, a_l, n_l) - B_{\text{DSP}} \le 0$$
+2. **Restrição de LUTs**:
+   $$g_{\text{LUT}}(\mathbf{x}) = \sum_{l=1}^L \text{LUT}_l(w_l, a_l, n_l) - B_{\text{LUT}} \le 0$$
+3. **Restrição de Flip-Flops (FFs)**:
+   $$g_{\text{FF}}(\mathbf{x}) = \sum_{l=1}^L \text{FF}_l(w_l, a_l, n_l) - B_{\text{FF}} \le 0$$
+4. **Restrição de Memória On-Chip (BRAM/URAM)**:
+   $$g_{\text{Mem}}(\mathbf{x}) = \sum_{l=1}^L \text{Bits}_l(w_l, n_l) - B_{\text{Mem}} \le 0$$
+
+### 4.3 Função Lagrangeana Multi-Recurso e Condições de KKT
+
+A função Lagrangeana associada ao problema restrito na FPGA VU13P, com vetor de multiplicadores duais (preços de sombra) $\boldsymbol{\mu} = [\mu_{\text{DSP}}, \mu_{\text{LUT}}, \mu_{\text{FF}}, \mu_{\text{Mem}}]^T \ge \mathbf{0}$, é dada por:
+
+$$\mathcal{L}(\mathbf{x}, \boldsymbol{\mu}) = \left( 1 - SP_{\text{val}}(\mathbf{x}) \right) + \sum_{j \in \mathcal{R}} \mu_j \, g_j(\mathbf{x})$$
+
+No ponto sela ótimo $(\mathbf{x}^*, \boldsymbol{\mu}^*)$, as quatro **Condições de Karush-Kuhn-Tucker (KKT)** exigem:
+1. **Estacionaridade (Minimização Primal)**:
+   $$\mathbf{x}^* \in \arg\min_{\mathbf{x}} \mathcal{L}(\mathbf{x}, \boldsymbol{\mu}^*) \quad \left( \nabla_{\mathbf{x}} \mathcal{L}(\mathbf{x}^*, \boldsymbol{\mu}^*) = \mathbf{0} \text{ no relaxamento contínuo} \right)$$
+2. **Viabilidade Primal**:
+   $$g_j(\mathbf{x}^*) \le 0, \quad \forall j \in \{\text{DSP}, \text{LUT}, \text{FF}, \text{Mem}\}$$
+3. **Viabilidade Dual**:
+   $$\mu_j^* \ge 0, \quad \forall j \in \{\text{DSP}, \text{LUT}, \text{FF}, \text{Mem}\}$$
+4. **Folga Complementar (*Complementary Slackness*)**:
+   $$\mu_j^* \cdot g_j(\mathbf{x}^*) = 0, \quad \forall j \in \{\text{DSP}, \text{LUT}, \text{FF}, \text{Mem}\}$$
+
+### 4.4 Algoritmo Iterativo Primal-Dual (Ascensão de Subgradiente Dual) e Critério de Parada
+
+Para resolver o problema sobre o espaço discreto de larguras de bits $(w_l, a_l)$ e hiperparâmetros $n_l$:
+- **Passo Primal ($t$)**: Para $\boldsymbol{\mu}^{(t)}$ fixo, busca-se a configuração $\mathbf{x}^{(t)}$ que minimiza o custo Lagrangeano penalizado:
+  $$\mathcal{L}_{\text{pen}}(\mathbf{x}, \boldsymbol{\mu}^{(t)}) = (1 - SP_{\text{val}}(\mathbf{x})) + \sum_{j \in \mathcal{R}} \mu_j^{(t)} \max\left(0, \tilde{g}_j(\mathbf{x})\right)$$
+  (integrando também a alocação analítica de bits por sensibilidade Hessiana $\Omega(\mathbf{w}) = \sum_l c_l 4^{-w_l}$ ponderada pelos custos ativos $\sum_j \mu_j^{(t)} \frac{\partial g_j}{\partial w_l}$).
+- **Passo Dual ($t \to t+1$)**: Atualizam-se os multiplicadores de Lagrange via ascensão de subgradiente projetada no ortante não-negativo:
+  $$\mu_j^{(t+1)} = \max\left( 0, \, \mu_j^{(t)} + \eta_{\mu} \, \tilde{g}_j(\mathbf{x}^{(t)}) \right), \quad \forall j \in \mathcal{R}$$
+- **Critério de Parada KKT**: O loop primal-dual encerra quando simultaneamente:
+  1. **Convergência do Índice-SP**: $\left| SP^{(t)} - \frac{1}{m}\sum_{k=1}^m SP^{(t-k)} \right| < \epsilon_{\text{SP}}$;
+  2. **Viabilidade Primal Estrita**: $\tilde{g}_j(\mathbf{x}^{(t)}) \le 0, \, \forall j \in \mathcal{R}$;
+  3. **Folga Complementar KKT**: $\left| \mu_j^{(t)} \cdot \tilde{g}_j(\mathbf{x}^{(t)}) \right| < \epsilon_{\text{KKT}}, \, \forall j \in \mathcal{R}$.
+
+---
+
+## 5. Otimização Bi-Objetivo de Hiperparâmetros (Pareto & TPE)
+
+### 5.1 Abordagem 1: Busca Black-Box com Penalidade Exterior (TPE)
 
 A função objetivo escalarizada incorpora o orçamento de hardware como penalidade suave:
 
@@ -167,7 +240,7 @@ $$\min_{\boldsymbol{\theta}} \Phi_\mu(\boldsymbol{\theta}) = -SP(\boldsymbol{\th
 
 O estimador TPE (*Tree-structured Parzen Estimator*) constrói distribuições probabilísticas $p(\boldsymbol{\theta}|y)$ para guiar a busca de filtros, tamanhos de kernel e taxas de aprendizado em direção a regiões viáveis de alto índice $SP$.
 
-### 4.2 Abordagem 2: Fronteira de Pareto com Algoritmo Genético NSGA-II
+### 5.2 Abordagem 2: Fronteira de Pareto com Algoritmo Genético NSGA-II
 
 Na formulação bi-objetivo:
 
