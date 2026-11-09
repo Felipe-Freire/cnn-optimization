@@ -497,3 +497,82 @@ def plot_pareto_and_roc_duel(
     else:
         plt.close(fig)
     return save_path
+
+
+def plot_primal_dual_kkt_evolution(
+    kkt_history: List[Dict[str, Any]],
+    save_path: str,
+    title_prefix: str = "Virtex UltraScale+ VU13P",
+    show: bool = False,
+) -> str:
+    """Plots Primal-Dual Lagrange-KKT optimization trajectory (SP-Index, Shadow Prices mu_j, and Constraints g_j)."""
+    set_academic_style()
+    iters = [item["iteration"] for item in kkt_history]
+    sp_vals = [item["sp_val"] * 100.0 for item in kkt_history]
+    lag_costs = [item["lagrangian_cost"] for item in kkt_history]
+
+    res_keys = list(kkt_history[0]["mu"].keys())
+    colors = {"DSP": "#e7298a", "LUT": "#1f4e79", "FF": "#1b9e77", "BRAM_bits": "#d95f02"}
+    markers = {"DSP": "^", "LUT": "o", "FF": "s", "BRAM_bits": "D"}
+
+    fig, axes = plt.subplots(1, 3, figsize=(16.5, 4.8))
+
+    # 1. SP-Index & Lagrangian Objective Evolution
+    ax1 = axes[0]
+    ax1_twin = ax1.twinx()
+    l1 = ax1.plot(iters, sp_vals, color="#1f4e79", marker="o", lw=2.2, label="Índice-SP Val [%]")
+    l2 = ax1_twin.plot(
+        iters, lag_costs, color="#d95f02", marker="s", linestyle="--", lw=1.8, label="Custo Lagrangeano L(x, μ)"
+    )
+    ax1.set_title(f"{title_prefix}: Índice-SP vs. Iteração", fontweight="bold")
+    ax1.set_xlabel("Iteração Primal-Dual (t)")
+    ax1.set_ylabel("Índice-SP de Validação [%]", color="#1f4e79")
+    ax1_twin.set_ylabel("Custo Lagrangeano L(x, μ)", color="#d95f02")
+    ax1.grid(True, linestyle=":", alpha=0.5)
+    lines = l1 + l2
+    labels = [l.get_label() for l in lines]
+    ax1.legend(lines, labels, loc="center right")
+
+    # 2. Evolution of Lagrange Multipliers (Shadow Prices mu_j)
+    ax2 = axes[1]
+    for rk in res_keys:
+        mu_series = [item["mu"][rk] for item in kkt_history]
+        ax2.plot(
+            iters, mu_series,
+            marker=markers.get(rk, "o"),
+            color=colors.get(rk, "black"),
+            lw=2.0,
+            label=f"μ_{rk} (Preço de Sombra)",
+        )
+    ax2.set_title("Evolução dos Multiplicadores (μ_j) - VU13P", fontweight="bold")
+    ax2.set_xlabel("Iteração Primal-Dual (t)")
+    ax2.set_ylabel("Multiplicador Dual (μ_j ≥ 0)")
+    ax2.grid(True, linestyle=":", alpha=0.5)
+    ax2.legend(loc="best")
+
+    # 3. Normalized Constraint Violations g_j(x) <= 0
+    ax3 = axes[2]
+    ax3.axhline(0.0, color="crimson", linestyle="--", lw=1.8, label="Limite Viável (g_j = 0)")
+    for rk in res_keys:
+        g_series = [item["g_val"][rk] * 100.0 for item in kkt_history]
+        ax3.plot(
+            iters, g_series,
+            marker=markers.get(rk, "o"),
+            color=colors.get(rk, "black"),
+            lw=1.8,
+            label=f"g_{rk}(x) [%]",
+        )
+    ax3.set_title("Viabilidade Primal das Restrições g_j(x) ≤ 0", fontweight="bold")
+    ax3.set_xlabel("Iteração Primal-Dual (t)")
+    ax3.set_ylabel("Excesso / Folga Relativa ao Orçamento [%]")
+    ax3.grid(True, linestyle=":", alpha=0.5)
+    ax3.legend(loc="best")
+
+    plt.tight_layout()
+    os.makedirs(os.path.dirname(save_path), exist_ok=True)
+    fig.savefig(save_path, dpi=300, bbox_inches="tight")
+    if show:
+        plt.show()
+    else:
+        plt.close(fig)
+    return save_path

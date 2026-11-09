@@ -1,6 +1,6 @@
-"""Mixed-precision bit allocation via Hessian sensitivity and Karush-Kuhn-Tucker (KKT)."""
+"""Mixed-precision bit allocation via Hessian sensitivity and Karush-Kuhn-Tucker (KKT) on VU13P."""
 
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 import numpy as np
 import tensorflow as tf
 
@@ -30,14 +30,12 @@ def compute_hutchinson_hessian_trace(
         Dictionary mapping layer name to its estimated Hessian trace Tr(H_i).
     """
     np.random.seed(seed)
-    # Identify layers that contain a trainable kernel weight
     target_layers = [l for l in model.layers if hasattr(l, "kernel") and l.kernel is not None]
     trainable_vars = [l.kernel for l in target_layers]
     layer_names = [l.name for l in target_layers]
     var_traces = {name: 0.0 for name in layer_names}
 
     for _ in range(num_hvp):
-        # Generate random Rademacher vector for each trainable kernel
         v_list = []
         for var in trainable_vars:
             rademacher = np.random.choice([-1.0, 1.0], size=var.shape).astype(np.float32)
@@ -48,23 +46,17 @@ def compute_hutchinson_hessian_trace(
                 y_pred = model(x_batch, training=False)
                 loss = loss_fn(y_batch, y_pred)
 
-            # First gradient: g = grad(loss, W)
             grads = inner_tape.gradient(loss, trainable_vars)
-
-            # Inner product between grad and random vector: sum_i (g_i * v_i)
             gv_products = [tf.reduce_sum(g * v) for g, v in zip(grads, v_list) if g is not None]
             total_gv = tf.add_n(gv_products)
 
-        # Second gradient: H * v = grad(total_gv, W)
         hvps = outer_tape.gradient(total_gv, trainable_vars)
 
         for name, v, hvp in zip(layer_names, v_list, hvps):
             if hvp is not None:
-                # v^T * (H * v)
                 quad_form = tf.reduce_sum(v * hvp).numpy()
                 var_traces[name] += float(quad_form) / num_hvp
 
-    # Ensure non-negative trace estimates
     return {k: max(1e-8, v) for k, v in var_traces.items()}
 
 
@@ -102,32 +94,18 @@ def solve_kkt_bit_allocation(
     b_max: int = 8,
     tol: float = 1e-5,
     max_iter: int = 100,
-) -> Dict[str, any]:
+) -> Dict[str, Any]:
     """Analytical Karush-Kuhn-Tucker (KKT) water-filling bit allocation under BOPs budget.
 
     Minimizes: sum_i [ c_i * 4^(-b_i) ]
     Subject to: sum_i [ a_i * b_i ] <= budget_bops, and b_min <= b_i <= b_max
 
     Stationarity gives: b_i*(lambda) = clip( 0.5 * log2( (c_i * ln 4) / (lambda * a_i) ), b_min, b_max )
-
-    Args:
-        layer_names: Names of quantized layers.
-        c_coeffs: Perturbation sensitivities c_i for each layer.
-        a_costs: Hardware cost weight a_i = MACs_i * b_a,i for each layer.
-        budget_bops: Maximum allowed BOPs budget B.
-        b_min: Minimum bitwidth limit (e.g. 2).
-        b_max: Maximum bitwidth limit (e.g. 8).
-        tol: Convergence tolerance for bisection.
-        max_iter: Max bisection iterations.
-
-    Returns:
-        Dictionary containing optimal lambda, continuous bits, discrete integer bits, and achieved BOPs.
     """
     c = np.array(c_coeffs, dtype=np.float64)
     a = np.array(a_costs, dtype=np.float64)
     ln4 = np.log(4.0)
 
-    # Check trivial boundary cases
     min_bops = np.sum(a * b_min)
     max_bops = np.sum(a * b_max)
 
@@ -148,7 +126,6 @@ def solve_kkt_bit_allocation(
             f"Budget {budget_bops} is strictly lower than minimum viable hardware cost {min_bops} (all layers at {b_min} bits)."
         )
 
-    # Function evaluating b_i(lambda)
     def get_bits(lam: float) -> np.ndarray:
         if lam <= 0:
             return np.full_like(a, b_max)
@@ -158,11 +135,9 @@ def solve_kkt_bit_allocation(
     def h_budget(lam: float) -> float:
         return float(np.sum(a * get_bits(lam)) - budget_bops)
 
-    # Bisection search on lambda
     lam_low = 1e-9
     lam_high = 1e4
 
-    # Expand bracket if needed
     while h_budget(lam_low) < 0:
         lam_low /= 10.0
     while h_budget(lam_high) > 0:
@@ -181,7 +156,6 @@ def solve_kkt_bit_allocation(
 
     optimal_continuous_b = get_bits(lam_mid)
 
-    # Discretization: Greedy integer rounding respecting budget
     floor_b = np.floor(optimal_continuous_b).astype(int)
     floor_b = np.clip(floor_b, b_min, b_max)
     current_bops = np.sum(a * floor_b)
@@ -212,3 +186,157 @@ def solve_kkt_bit_allocation(
         "budget_bops": budget_bops,
         "budget_active": True,
     }
+
+
+def check_kkt_stopping_criteria(
+    sp_history: List[float],
+    g_val: Dict[str, float],
+    mu: Dict[str, float],
+    tol_sp: float = 1e-4,
+    tol_kkt: float = 1e-3,
+    window: int = 3,
+) -> Tuple[bool, Dict[str, Any]]:
+    """Checks KKT convergence criteria: SP stabilization, Primal Feasibility, and Complementary Slackness.
+
+    Conditions at optimal point (x*, mu*):
+    1. SP-Index Stabilization: |SP[-1] - mean(SP[-window-1:-1])| < tol_sp
+    2. Primal Feasibility: g_j(x*) <= 0 for all j in {'DSP', 'LUT', 'FF', 'BRAM_bits'}
+    3. Dual Feasibility: mu_j* >= 0 for all j
+    4. Complementary Slackness: |mu_j* * g_j(x*)| < tol_kkt for all j
+
+    Args:
+        sp_history: History of validation SP-Index values across iterations.
+        g_val: Constraint violations g_j(x) (normalized or raw).
+        mu: Current Lagrange multipliers mu_j.
+        tol_sp: Convergence tolerance for SP stabilization.
+        tol_kkt: Tolerance for complementary slackness |mu_j * g_j|.
+        window: Moving window size to check SP stabilization.
+
+    Returns:
+        Tuple of (is_converged: bool, diagnostics: dict).
+    """
+    sp_converged = False
+    sp_change = 1.0
+    if len(sp_history) > window:
+        sp_change = float(abs(sp_history[-1] - np.mean(sp_history[-(window + 1):-1])))
+        if sp_change < tol_sp:
+            sp_converged = True
+
+    primal_feasible = all(float(g) <= 1e-9 for g in g_val.values())
+    dual_feasible = all(float(m) >= -1e-12 for m in mu.values())
+    slackness_products = {k: float(abs(mu[k] * g_val[k])) for k in mu.keys()}
+    complementary_slackness = all(val < tol_kkt for val in slackness_products.values())
+
+    converged = bool(sp_converged and primal_feasible and dual_feasible and complementary_slackness)
+    diagnostics = {
+        "converged": converged,
+        "sp_converged": sp_converged,
+        "sp_change": sp_change,
+        "primal_feasible": primal_feasible,
+        "dual_feasible": dual_feasible,
+        "complementary_slackness": complementary_slackness,
+        "slackness_products": slackness_products,
+    }
+    return converged, diagnostics
+
+
+class LagrangeKKTQuantizerOptimizer:
+    """Primal-Dual optimizer with Lagrange Multipliers and KKT conditions for VU13P FPGA constraints.
+
+    Formulates the constrained problem:
+        min_x L_SP(x) = (1 - SP_val(x))
+        subject to: g_j(x) = (Resource_j(x) - Limit_j) / Limit_j <= 0
+                    for j in {'DSP', 'LUT', 'FF', 'BRAM_bits'}.
+    """
+
+    def __init__(
+        self,
+        hardware_limits: Dict[str, float],
+        lr_x: float = 0.05,
+        lr_mu: float = 0.25,
+        normalize_constraints: bool = True,
+    ):
+        self.limits = {k: float(v) for k, v in hardware_limits.items()}
+        self.lr_x = lr_x
+        self.lr_mu = lr_mu
+        self.normalize_constraints = normalize_constraints
+
+        # Dual variables (shadow prices) mu_j >= 0
+        self.mu: Dict[str, float] = {k: 0.0 for k in self.limits.keys()}
+        self.history: List[Dict[str, Any]] = []
+
+    def evaluate_constraints(
+        self, resource_usage: Dict[str, float]
+    ) -> Tuple[Dict[str, float], Dict[str, float]]:
+        """Computes raw g_j(x) = R_j - B_j and normalized g_norm_j(x) = (R_j - B_j) / B_j."""
+        g_raw = {}
+        g_norm = {}
+        for k, limit_val in self.limits.items():
+            used = float(resource_usage.get(k, 0.0))
+            diff = used - limit_val
+            g_raw[k] = diff
+            denom = max(limit_val, 1.0)
+            g_norm[k] = diff / denom
+        return g_raw, g_norm
+
+    def lagrangian_penalty(
+        self, sp_loss: float, resource_usage: Dict[str, float]
+    ) -> Tuple[float, Dict[str, float]]:
+        """Computes the penalized Lagrangian cost L(x, mu) = (1 - SP) + sum_j mu_j * max(0, g_j(x)).
+
+        Args:
+            sp_loss: Primal objective loss (1 - SP_val(x)).
+            resource_usage: Estimated hardware usage dict {'DSP', 'LUT', 'FF', 'BRAM_bits'}.
+
+        Returns:
+            Tuple of (total_lagrangian_cost, active_g_val_dict).
+        """
+        g_raw, g_norm = self.evaluate_constraints(resource_usage)
+        g_used = g_norm if self.normalize_constraints else g_raw
+
+        penalty = 0.0
+        for k in self.limits.keys():
+            penalty += self.mu[k] * max(0.0, g_used[k])
+
+        total_cost = float(sp_loss + penalty)
+        return total_cost, g_used
+
+    def update_multipliers(self, g_val: Dict[str, float]) -> Dict[str, float]:
+        """Dual update via projected subgradient ascent + complementary slackness relaxation.
+
+        Standard subgradient step:
+            mu_j^{(t+1)} = max(0, mu_j^{(t)} + lr_mu * g_j(x^{(t)}))
+        Ensures dual feasibility (mu_j >= 0) and decays inactive multipliers (g_j < 0)
+        toward 0 so that complementary slackness (mu_j * g_j = 0) holds at feasibility.
+        """
+        for k in self.mu.keys():
+            updated = self.mu[k] + self.lr_mu * float(g_val[k])
+            self.mu[k] = float(max(0.0, updated))
+        return self.mu.copy()
+
+    def record_step(
+        self,
+        iteration: int,
+        sp_val: float,
+        w_bits: Dict[str, int],
+        a_bits: Dict[str, int],
+        resource_usage: Dict[str, float],
+        g_val: Dict[str, float],
+        lagrangian_cost: float,
+        kkt_diag: Dict[str, Any],
+    ) -> None:
+        """Records full primal-dual telemetry for plotting and article tables."""
+        g_raw, _ = self.evaluate_constraints(resource_usage)
+        self.history.append({
+            "iteration": iteration,
+            "sp_val": float(sp_val),
+            "sp_loss": float(1.0 - sp_val),
+            "lagrangian_cost": float(lagrangian_cost),
+            "w_bits": dict(w_bits),
+            "a_bits": dict(a_bits),
+            "resources": {k: float(v) for k, v in resource_usage.items()},
+            "g_raw": {k: float(v) for k, v in g_raw.items()},
+            "g_val": {k: float(v) for k, v in g_val.items()},
+            "mu": {k: float(v) for k, v in self.mu.items()},
+            "kkt_diagnostics": kkt_diag,
+        })

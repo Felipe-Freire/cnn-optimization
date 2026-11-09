@@ -2,7 +2,7 @@
 
 import os
 os.environ["TF_USE_LEGACY_KERAS"] = "1"
-from typing import Dict, Optional, Tuple
+from typing import Dict, Optional, Tuple, Union
 import tensorflow as tf
 import tf_keras as keras
 import qkeras
@@ -51,18 +51,18 @@ def build_compact_qcnn1d(
     kernel_size: int = 3,
     dense_units: int = 8,
     weights_bits: Optional[Dict[str, int]] = None,
-    act_bits: int = 8,
+    act_bits: Union[int, Dict[str, int]] = 8,
     learning_rate: float = 1e-3,
 ) -> keras.Model:
-    """Builds a simplified compact 1D CNN using QKeras with heterogeneous layer bitwidths.
+    """Builds a simplified compact 1D CNN using QKeras with heterogeneous layer bitwidths (w_l, a_l).
 
     Args:
-        input_dim: Number of input calorimeter rings (e.g. 50).
-        num_filters: Number of filters in QConv1D.
+        input_dim: Number of input calorimeter rings (e.g. 25, 50, or 100).
+        num_filters: Number of filters in QConv1D (n_1).
         kernel_size: Size of 1D convolutional kernel.
-        dense_units: Hidden units in QDense layer.
-        weights_bits: Mapping from layer name to its integer bitwidth (e.g. from KKT allocation).
-        act_bits: Quantization bitwidth for activations.
+        dense_units: Hidden units in QDense layer (n_2).
+        weights_bits: Mapping from layer name to its integer weight bitwidth w_l.
+        act_bits: Global activation bitwidth (int) or per-layer dict {'conv1d_1': a_1, 'dense_1': a_2}.
         learning_rate: Adam optimizer learning rate.
 
     Returns:
@@ -71,9 +71,22 @@ def build_compact_qcnn1d(
     if weights_bits is None:
         weights_bits = {}
 
-    b_conv = weights_bits.get("conv1d_1", 8)
-    b_dense = weights_bits.get("dense_1", 8)
-    b_out = weights_bits.get("output_dense", 8)
+    b_conv = int(weights_bits.get("conv1d_1", 8))
+    b_dense = int(weights_bits.get("dense_1", 8))
+    b_out = int(weights_bits.get("output_dense", 8))
+
+    if isinstance(act_bits, dict):
+        a_conv = int(act_bits.get("conv1d_1", 8))
+        a_dense = int(act_bits.get("dense_1", 8))
+    else:
+        a_conv = int(act_bits)
+        a_dense = int(act_bits)
+
+    int_w_conv = min(2, max(0, b_conv - 1))
+    int_w_dense = min(2, max(0, b_dense - 1))
+    int_w_out = min(2, max(0, b_out - 1))
+    int_a_conv = min(2, max(0, a_conv - 1))
+    int_a_dense = min(2, max(0, a_dense - 1))
 
     model = keras.Sequential([
         keras.layers.Input(shape=(input_dim,), name="input_rings"),
@@ -82,24 +95,24 @@ def build_compact_qcnn1d(
             filters=num_filters,
             kernel_size=kernel_size,
             padding="same",
-            kernel_quantizer=quantized_bits(bits=b_conv, integer=2, alpha=1),
-            bias_quantizer=quantized_bits(bits=b_conv, integer=2, alpha=1),
+            kernel_quantizer=quantized_bits(bits=b_conv, integer=int_w_conv, alpha=1),
+            bias_quantizer=quantized_bits(bits=b_conv, integer=int_w_conv, alpha=1),
             name="conv1d_1",
         ),
-        QActivation(activation=quantized_relu(bits=act_bits, integer=2), name="relu_conv1"),
+        QActivation(activation=quantized_relu(bits=a_conv, integer=int_a_conv), name="relu_conv1"),
         keras.layers.MaxPooling1D(pool_size=2, name="maxpool_1"),
         keras.layers.Flatten(name="flatten_1"),
         QDense(
             units=dense_units,
-            kernel_quantizer=quantized_bits(bits=b_dense, integer=2, alpha=1),
-            bias_quantizer=quantized_bits(bits=b_dense, integer=2, alpha=1),
+            kernel_quantizer=quantized_bits(bits=b_dense, integer=int_w_dense, alpha=1),
+            bias_quantizer=quantized_bits(bits=b_dense, integer=int_w_dense, alpha=1),
             name="dense_1",
         ),
-        QActivation(activation=quantized_relu(bits=act_bits, integer=2), name="relu_dense1"),
+        QActivation(activation=quantized_relu(bits=a_dense, integer=int_a_dense), name="relu_dense1"),
         QDense(
             units=1,
-            kernel_quantizer=quantized_bits(bits=b_out, integer=2, alpha=1),
-            bias_quantizer=quantized_bits(bits=b_out, integer=2, alpha=1),
+            kernel_quantizer=quantized_bits(bits=b_out, integer=int_w_out, alpha=1),
+            bias_quantizer=quantized_bits(bits=b_out, integer=int_w_out, alpha=1),
             activation="sigmoid",
             name="output_dense",
         ),
