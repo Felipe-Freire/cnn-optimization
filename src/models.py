@@ -124,3 +124,23 @@ def build_compact_qcnn1d(
         metrics=["accuracy"],
     )
     return model
+
+
+def transfer_weights_to_qmodel(
+    source_model: keras.Model, target_qmodel: keras.Model
+) -> None:
+    """Transfers learned weights/biases from an FP32 reference model to a QKeras model (Warm-Start QAT).
+
+    Matches layers by name ('conv1d_1', 'dense_1', 'output_dense') when shapes are compatible,
+    reducing stochastic variance during Primal-Dual Lagrange-KKT iterations.
+    """
+    source_layers = {l.name: l for l in source_model.layers}
+    for t_layer in target_qmodel.layers:
+        if t_layer.name in source_layers:
+            s_layer = source_layers[t_layer.name]
+            s_weights = s_layer.get_weights()
+            t_weights = t_layer.get_weights()
+            if len(s_weights) == len(t_weights) and all(
+                sw.shape == tw.shape for sw, tw in zip(s_weights, t_weights)
+            ):
+                t_layer.set_weights(s_weights)

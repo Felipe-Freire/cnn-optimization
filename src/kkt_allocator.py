@@ -203,17 +203,6 @@ def check_kkt_stopping_criteria(
     2. Primal Feasibility: g_j(x*) <= 0 for all j in {'DSP', 'LUT', 'FF', 'BRAM_bits'}
     3. Dual Feasibility: mu_j* >= 0 for all j
     4. Complementary Slackness: |mu_j* * g_j(x*)| < tol_kkt for all j
-
-    Args:
-        sp_history: History of validation SP-Index values across iterations.
-        g_val: Constraint violations g_j(x) (normalized or raw).
-        mu: Current Lagrange multipliers mu_j.
-        tol_sp: Convergence tolerance for SP stabilization.
-        tol_kkt: Tolerance for complementary slackness |mu_j * g_j|.
-        window: Moving window size to check SP stabilization.
-
-    Returns:
-        Tuple of (is_converged: bool, diagnostics: dict).
     """
     sp_converged = False
     sp_change = 1.0
@@ -241,25 +230,28 @@ def check_kkt_stopping_criteria(
 
 
 class LagrangeKKTQuantizerOptimizer:
-    """Primal-Dual optimizer with Lagrange Multipliers and KKT conditions for VU13P FPGA constraints.
+    """Closed-Loop Primal-Dual optimizer with Lagrange Multipliers and KKT conditions on VU13P.
 
-    Formulates the constrained problem:
-        min_x L_SP(x) = (1 - SP_val(x))
-        subject to: g_j(x) = (Resource_j(x) - Limit_j) / Limit_j <= 0
-                    for j in {'DSP', 'LUT', 'FF', 'BRAM_bits'}.
+    Implements the 3-step loop:
+    1. QUANTIZED NEURAL NETWORK (QKeras): Configures bitwidths and architecture (w_l, a_l, n_l).
+    2. PERFORMANCE & COST EVALUATION: Computes SP-Index loss (1 - SP) and VU13P resources.
+    3. LAGRANGE / KKT OPTIMIZATION CORE: Evaluates g_j(x) <= 0, updates shadow prices (mu_j),
+       and computes the next primal bitwidth allocation (w_l^{(t+1)}, a_l^{(t+1)}).
     """
 
     def __init__(
         self,
         hardware_limits: Dict[str, float],
         lr_x: float = 0.05,
-        lr_mu: float = 0.25,
+        lr_mu: float = 0.50,
         normalize_constraints: bool = True,
+        slack_decay: float = 0.30,
     ):
         self.limits = {k: float(v) for k, v in hardware_limits.items()}
         self.lr_x = lr_x
         self.lr_mu = lr_mu
         self.normalize_constraints = normalize_constraints
+        self.slack_decay = slack_decay
 
         # Dual variables (shadow prices) mu_j >= 0
         self.mu: Dict[str, float] = {k: 0.0 for k in self.limits.keys()}
@@ -282,15 +274,7 @@ class LagrangeKKTQuantizerOptimizer:
     def lagrangian_penalty(
         self, sp_loss: float, resource_usage: Dict[str, float]
     ) -> Tuple[float, Dict[str, float]]:
-        """Computes the penalized Lagrangian cost L(x, mu) = (1 - SP) + sum_j mu_j * max(0, g_j(x)).
-
-        Args:
-            sp_loss: Primal objective loss (1 - SP_val(x)).
-            resource_usage: Estimated hardware usage dict {'DSP', 'LUT', 'FF', 'BRAM_bits'}.
-
-        Returns:
-            Tuple of (total_lagrangian_cost, active_g_val_dict).
-        """
+        """Computes the penalized Lagrangian cost L(x, mu) = (1 - SP) + sum_j mu_j * max(0, g_j(x))."""
         g_raw, g_norm = self.evaluate_constraints(resource_usage)
         g_used = g_norm if self.normalize_constraints else g_raw
 
@@ -302,17 +286,93 @@ class LagrangeKKTQuantizerOptimizer:
         return total_cost, g_used
 
     def update_multipliers(self, g_val: Dict[str, float]) -> Dict[str, float]:
-        """Dual update via projected subgradient ascent + complementary slackness relaxation.
+        """Dual update via projected subgradient ascent + complementary slackness projection.
 
-        Standard subgradient step:
-            mu_j^{(t+1)} = max(0, mu_j^{(t)} + lr_mu * g_j(x^{(t)}))
-        Ensures dual feasibility (mu_j >= 0) and decays inactive multipliers (g_j < 0)
-        toward 0 so that complementary slackness (mu_j * g_j = 0) holds at feasibility.
+        - If g_j(x) > 0 (resource limit violated): increases shadow price mu_j^{(t+1)} = mu_j^{(t)} + lr_mu * g_j.
+        - If g_j(x) <= 0 (resource feasible with slack): decays mu_j toward 0 so that
+          complementary slackness (mu_j* * g_j(x*) = 0) is strictly satisfied for inactive constraints.
         """
         for k in self.mu.keys():
-            updated = self.mu[k] + self.lr_mu * float(g_val[k])
-            self.mu[k] = float(max(0.0, updated))
+            gv = float(g_val[k])
+            if gv > 0.0:
+                self.mu[k] = float(self.mu[k] + self.lr_mu * gv)
+            else:
+                updated = self.mu[k] + self.lr_mu * gv
+                self.mu[k] = float(max(0.0, min(updated, self.mu[k] * self.slack_decay)))
         return self.mu.copy()
+
+    def compute_primal_bit_update(
+        self,
+        layer_names: List[str],
+        c_coeffs: List[float],
+        macs_list: List[float],
+        params_list: List[float],
+        current_w: Dict[str, int],
+        current_a: Dict[str, int],
+        b_min: int = 2,
+        b_max: int = 8,
+    ) -> Tuple[Dict[str, int], Dict[str, int], Dict[str, Any]]:
+        """Computes the next primal configuration (w_l^{(t+1)}, a_l^{(t+1)}) from current shadow prices mu_j.
+
+        Follows KKT stationarity on the VU13P:
+        1. If mu_DSP > 0 or B_DSP == 0: enforces sub-byte arithmetic (w_l <= 8, a_l <= 8) so DSP = 0.
+        2. If mu_LUT > 0 or mu_BRAM > 0: computes the effective BOPs/LUT budget from B_LUT and B_BRAM
+           and solves the analytical KKT water-filling problem weighted by layer sensitivities c_l.
+        3. Adapts activation bitwidths a_l on high-MAC layers when LUT pressure remains active.
+        """
+        # 1. Enforce DSP constraint (UltraScale+ uses DSP48E2 when w_l > 8 or a_l > 8)
+        eff_b_max = b_max if (self.mu.get("DSP", 0.0) > 0.0 or self.limits.get("DSP", 0.0) <= 0.0) else 16
+
+        # 2. Check if all constraints are already feasible and only DSP was violated at 16-bit
+        lut_pressure = self.mu.get("LUT", 0.0)
+        bram_pressure = self.mu.get("BRAM_bits", 0.0)
+        ff_pressure = self.mu.get("FF", 0.0)
+
+        # If no LUT/BRAM multiplier is active yet (e.g., right after 16-bit DSP violation),
+        # step down to uniform 8-bit first so the dual loop can measure pure LUT/BRAM pressure.
+        if lut_pressure <= 1e-9 and any(v > 8 for v in current_w.values()):
+            next_w = {name: eff_b_max for name in layer_names}
+            next_a = {name: eff_b_max for name in current_a.keys()}
+            return next_w, next_a, {"regime": "sub_byte_8bit_projection"}
+
+        # 3. When LUT or BRAM shadow prices are active, solve KKT water-filling under VU13P LUT/BRAM ceiling
+        a_bits_vec = np.array([float(current_a.get(name, 8)) for name in layer_names], dtype=np.float64)
+        macs_vec = np.array(macs_list, dtype=np.float64)
+        a_costs = (macs_vec * a_bits_vec).tolist()
+
+        # Target BOPs derived from VU13P LUT budget (since LUT = BOPs / 18 in sub-byte mode)
+        lut_limit = self.limits.get("LUT", 2500.0)
+        bops_from_lut_limit = lut_limit * 18.0
+
+        # Tighten effective budget proportionally to accumulated shadow price mu_LUT + mu_BRAM
+        pressure_factor = min(1.0, max(0.58, 1.0 / (1.0 + 0.35 * (lut_pressure + bram_pressure + ff_pressure))))
+        bops_8bit = float(np.sum(macs_vec * 8.0 * 8.0))
+        target_bops = min(bops_from_lut_limit, bops_8bit * pressure_factor)
+
+        kkt_sol = solve_kkt_bit_allocation(
+            layer_names=layer_names,
+            c_coeffs=c_coeffs,
+            a_costs=a_costs,
+            budget_bops=target_bops,
+            b_min=b_min,
+            b_max=eff_b_max,
+        )
+        next_w = kkt_sol["integer_bits"]
+
+        # Check resulting LUT usage with current_a; if LUT > lut_limit, quantize dense activation to 6 bits
+        est_bops_with_cur_a = sum(
+            macs_list[i] * next_w[name] * current_a.get(name, 8)
+            for i, name in enumerate(layer_names)
+        )
+        est_luts = est_bops_with_cur_a / 18.0
+        next_a = dict(current_a)
+        for k in next_a:
+            next_a[k] = min(next_a[k], eff_b_max)
+
+        if est_luts > lut_limit and "dense_1" in next_a:
+            next_a["dense_1"] = 6
+
+        return next_w, next_a, kkt_sol
 
     def record_step(
         self,

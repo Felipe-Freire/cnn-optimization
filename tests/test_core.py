@@ -18,7 +18,7 @@ from src.kkt_allocator import (
     check_kkt_stopping_criteria,
     solve_kkt_bit_allocation,
 )
-from src.models import build_compact_cnn1d_fp32, build_compact_qcnn1d
+from src.models import build_compact_cnn1d_fp32, build_compact_qcnn1d, transfer_weights_to_qmodel
 from src.visualization import plot_primal_dual_kkt_evolution
 
 
@@ -73,13 +73,14 @@ def test_models_forward_pass():
     pred_fp32 = m_fp32(dummy_x)
     assert pred_fp32.shape == (4, 1)
 
-    # QKeras model
+    # QKeras model + Warm-Start weight transfer
     m_q = build_compact_qcnn1d(
         input_dim=50,
         num_filters=4,
         dense_units=4,
         weights_bits={"conv1d_1": 6, "dense_1": 4, "output_dense": 4},
     )
+    transfer_weights_to_qmodel(m_fp32, m_q)
     pred_q = m_q(dummy_x)
     assert pred_q.shape == (4, 1)
 
@@ -143,3 +144,16 @@ def test_vu13p_estimator_and_primal_dual_kkt(tmp_path):
 
     plot_path = plot_primal_dual_kkt_evolution(opt.history, save_path=str(tmp_path / "kkt_evo.png"))
     assert os.path.isfile(plot_path) and os.path.getsize(plot_path) > 0
+
+    # Test compute_primal_bit_update driven by shadow prices
+    opt.mu = {"DSP": 8.0, "LUT": 0.8, "FF": 0.0, "BRAM_bits": 0.4}
+    next_w, next_a, _ = opt.compute_primal_bit_update(
+        layer_names=["conv1d_1", "dense_1", "output_dense"],
+        c_coeffs=[0.05, 1.5, 0.2],
+        macs_list=[600.0, 768.0, 8.0],
+        params_list=[32.0, 776.0, 9.0],
+        current_w={"conv1d_1": 8, "dense_1": 8, "output_dense": 8},
+        current_a={"conv1d_1": 8, "dense_1": 8},
+    )
+    assert all(2 <= v <= 8 for v in next_w.values())
+    assert next_w["dense_1"] >= next_w["conv1d_1"]

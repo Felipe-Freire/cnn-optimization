@@ -19,8 +19,9 @@ from src.visualization import (
     plot_fa_per_fold_workpoints,
     plot_learning_curves,
     plot_output_score_histogram,
-    plot_pareto_and_roc_duel,
     plot_rings_profile,
+    plot_roc_duel_fp32_vs_kkt,
+    plot_vu13p_resource_utilization,
 )
 
 
@@ -199,10 +200,30 @@ def test_all_visualizations(tmp_path):
     )
     assert os.path.isfile(p8) and os.path.getsize(p8) > 0
 
-    p9 = plot_pareto_and_roc_duel(
+    p9 = plot_roc_duel_fp32_vs_kkt(
         y_true, y_pred, 0.96, 0.97, 0.04,
         y_pred, 0.95, 0.96, 0.05,
-        0.5, [10000, 20000], [0.94, 0.96], [10000, 20000], [0.94, 0.96], 12000,
-        save_path=str(tmp_path / "pareto.png")
+        0.5,
+        save_path=str(tmp_path / "roc_duel.png")
     )
     assert os.path.isfile(p9) and os.path.getsize(p9) > 0
+
+    hw_8b = {
+        "vu13p_resources": {"DSP": 0.0, "LUT": 4892.0, "FF": 7224.0, "BRAM_bits": 6536.0},
+        "breakdown": [
+            {"layer_name": "conv1d_1", "LUT": 2133.0, "b_w": 8, "b_a": 8},
+            {"layer_name": "dense_1", "LUT": 2730.0, "b_w": 8, "b_a": 8},
+            {"layer_name": "output_dense", "LUT": 28.0, "b_w": 8, "b_a": 8},
+        ],
+    }
+    hw_kkt = {
+        "vu13p_resources": {"DSP": 0.0, "LUT": 2364.0, "FF": 5416.0, "BRAM_bits": 4824.0},
+        "breakdown": [
+            {"layer_name": "conv1d_1", "LUT": 800.0, "b_w": 3, "b_a": 8},
+            {"layer_name": "dense_1", "LUT": 1536.0, "b_w": 6, "b_a": 6},
+            {"layer_name": "output_dense", "LUT": 28.0, "b_w": 8, "b_a": 8},
+        ],
+    }
+    budget = {"DSP": 0.0, "LUT": 2500.0, "FF": 10000.0, "BRAM_bits": 5500.0}
+    p10 = plot_vu13p_resource_utilization(hw_8b, hw_kkt, budget, save_path=str(tmp_path / "vu13p_res.png"))
+    assert os.path.isfile(p10) and os.path.getsize(p10) > 0

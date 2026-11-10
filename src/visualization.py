@@ -431,7 +431,7 @@ def plot_fa_per_fold_workpoints(
     return save_path
 
 
-def plot_pareto_and_roc_duel(
+def plot_roc_duel_fp32_vs_kkt(
     y_val: np.ndarray,
     y_pred_fp32: np.ndarray,
     sp_fp32: float,
@@ -442,52 +442,132 @@ def plot_pareto_and_roc_duel(
     pd_q: float,
     fa_q: float,
     bops_ratio: float,
-    all_bops: List[float],
-    all_sp: List[float],
-    pareto_bops: List[float],
-    pareto_sp: List[float],
-    kkt_bops: float,
     save_path: str,
+    title_prefix: str = "QCNN1D KKT",
     show: bool = False,
 ) -> str:
-    """Plots side-by-side ROC comparison and NSGA-II Pareto frontier."""
+    """Plots side-by-side Global ROC and Operational Trigger Zoom ROC comparing FP32 vs. Lagrange-KKT QKeras."""
     set_academic_style()
     fig, axes = plt.subplots(1, 2, figsize=(14, 5.2))
 
     fa_f, pd_f, _ = roc_curve(y_val, y_pred_fp32)
     fa_qk, pd_qk, _ = roc_curve(y_val, y_pred_q)
 
-    axes[0].plot(fa_f * 100, pd_f * 100, label=f"Baseline FP32 (SP={sp_fp32:.4f})", color="#1f4e79", lw=2.2)
+    # Panel 1: Global Operational ROC
+    axes[0].plot(fa_f * 100, pd_f * 100, label=f"Referência FP32 (SP={sp_fp32*100:.2f}%)", color="#1f4e79", lw=2.2)
     axes[0].plot(
         fa_qk * 100, pd_qk * 100,
-        label=f"KKT QKeras ({bops_ratio*100:.0f}% BOPs, SP={sp_q:.4f})",
+        label=f"{title_prefix} ({bops_ratio*100:.1f}% BOPs, SP={sp_q*100:.2f}%)",
         color="#d95f02", lw=2.2, linestyle="--"
     )
-    axes[0].plot([fa_fp32 * 100], [pd_fp32 * 100], marker="*", markersize=12, color="navy", label="Knee FP32")
-    axes[0].plot([fa_q * 100], [pd_q * 100], marker="o", markersize=8, color="darkorange", label="Knee QKeras KKT")
+    axes[0].plot([fa_fp32 * 100], [pd_fp32 * 100], marker="*", markersize=12, color="navy", label=f"Knee FP32 (PD={pd_fp32*100:.2f}%, FA={fa_fp32*100:.2f}%)")
+    axes[0].plot([fa_q * 100], [pd_q * 100], marker="o", markersize=8, color="darkorange", label=f"Knee KKT (PD={pd_q*100:.2f}%, FA={fa_q*100:.2f}%)")
 
-    axes[0].set_title("Curva ROC e Pontos de Operação (Knee SP)", fontweight="bold")
+    axes[0].set_title("Duelo ROC: Referência FP32 vs. QKeras Lagrange/KKT", fontweight="bold")
     axes[0].set_xlabel("Taxa de Falso Alarme - FA [%]")
     axes[0].set_ylabel("Probabilidade de Detecção - PD [%]")
-    axes[0].set_xlim(-0.2, 10.0)
-    axes[0].set_ylim(90.0, 100.2)
-    axes[0].grid(True, linestyle=":", alpha=0.4)
+    axes[0].set_xlim(-0.2, 12.0)
+    axes[0].set_ylim(88.0, 100.2)
+    axes[0].grid(True, linestyle=":", alpha=0.5)
     axes[0].legend(loc="lower right")
 
-    axes[1].scatter(all_bops, all_sp, color="gray", alpha=0.5, label="Espaço Explorado (Trials)")
-    # Sort Pareto points by BOPs for a connected frontier line
-    sorted_pairs = sorted(zip(pareto_bops, pareto_sp), key=lambda x: x[0])
-    if sorted_pairs:
-        p_b, p_s = zip(*sorted_pairs)
-        axes[1].plot(p_b, p_s, color="#e7298a", linestyle="-.", lw=1.8, alpha=0.8)
-    axes[1].scatter(pareto_bops, pareto_sp, color="#e7298a", s=90, edgecolor="black", zorder=4, label="Fronteira de Pareto (NSGA-II)")
-    axes[1].scatter([kkt_bops], [sp_q], color="forestgreen", marker="^", s=130, edgecolor="black", zorder=5, label="Ponto Ótimo Analítico (KKT)")
+    # Panel 2: Zoom on High-Efficiency ATLAS Trigger Working Points (PD in [94%, 100%])
+    axes[1].plot(fa_f * 100, pd_f * 100, label="Referência FP32", color="#1f4e79", lw=2.2)
+    axes[1].plot(fa_qk * 100, pd_qk * 100, label=f"{title_prefix} (Lagrange/KKT)", color="#d95f02", lw=2.2, linestyle="--")
 
-    axes[1].set_title("Fronteira de Pareto: Índice SP vs. Custo em Silício (BOPs)", fontweight="bold")
-    axes[1].set_xlabel("Custo de Hardware (BOPs)")
-    axes[1].set_ylabel("Índice Soma-Produto (SP)")
-    axes[1].grid(True, linestyle=":", alpha=0.4)
-    axes[1].legend(loc="lower right")
+    wps = [("Tight (96%)", 0.96, "o", "#1b9e77"), ("Medium (97.5%)", 0.975, "s", "#7570b3"), ("Loose (98.5%)", 0.985, "^", "#e7298a")]
+    for wp_label, target_pd, marker, col in wps:
+        idx_q = int(np.argmin(np.abs(pd_qk - target_pd)))
+        idx_f = int(np.argmin(np.abs(pd_f - target_pd)))
+        axes[1].plot(
+            [fa_qk[idx_q] * 100], [pd_qk[idx_q] * 100],
+            marker=marker, markersize=8, color=col,
+            label=f"{wp_label}: FA KKT={fa_qk[idx_q]*100:.2f}% (FP32={fa_f[idx_f]*100:.2f}%)"
+        )
+
+    axes[1].set_title("Zoom nos Pontos de Operação do Trigger ATLAS (L0 Ringer)", fontweight="bold")
+    axes[1].set_xlabel("Taxa de Falso Alarme - FA [%]")
+    axes[1].set_ylabel("Probabilidade de Detecção - PD [%]")
+    axes[1].set_xlim(-0.1, 8.0)
+    axes[1].set_ylim(94.0, 100.1)
+    axes[1].grid(True, linestyle=":", alpha=0.5)
+    axes[1].legend(loc="lower right", fontsize=9)
+
+    plt.tight_layout()
+    os.makedirs(os.path.dirname(save_path), exist_ok=True)
+    fig.savefig(save_path, dpi=300, bbox_inches="tight")
+    if show:
+        plt.show()
+    else:
+        plt.close(fig)
+    return save_path
+
+
+def plot_vu13p_resource_utilization(
+    hw_8bit: Dict[str, Any],
+    hw_kkt: Dict[str, Any],
+    vu13p_budget: Dict[str, float],
+    save_path: str,
+    title_prefix: str = "Virtex UltraScale+ VU13P",
+    show: bool = False,
+) -> str:
+    """Plots VU13P resource consumption (% of instance budget) and per-layer LUT/BRAM breakdown."""
+    set_academic_style()
+    fig, axes = plt.subplots(1, 2, figsize=(14.5, 5.2))
+
+    # Panel 1: Resource Utilization (% of Instance Budget B_j) for LUT, FF, BRAM_bits
+    res_keys = ["LUT", "FF", "BRAM_bits"]
+    res_labels = ["CLB LUTs", "CLB Flip-Flops", "Block RAM [bits]"]
+
+    u_8b = [hw_8bit["vu13p_resources"][k] / max(vu13p_budget[k], 1.0) * 100.0 for k in res_keys]
+    u_kkt = [hw_kkt["vu13p_resources"][k] / max(vu13p_budget[k], 1.0) * 100.0 for k in res_keys]
+
+    x = np.arange(len(res_keys))
+    width = 0.35
+
+    b1 = axes[0].bar(x - width / 2, u_8b, width, label="Uniforme 8-bit (Inviável em LUT/BRAM)", color="#a33030", alpha=0.8)
+    b2 = axes[0].bar(x + width / 2, u_kkt, width, label="Otimizado Lagrange/KKT (Viável ≤ 100%)", color="#1b9e77", alpha=0.85)
+    axes[0].axhline(100.0, color="black", linestyle="--", lw=1.8, label="Limite de Orçamento VU13P (100%)")
+
+    for bar in b1:
+        h = bar.get_height()
+        axes[0].text(bar.get_x() + bar.get_width() / 2, h + 2.0, f"{h:.1f}%", ha="center", va="bottom", fontsize=9, fontweight="bold")
+    for bar in b2:
+        h = bar.get_height()
+        axes[0].text(bar.get_x() + bar.get_width() / 2, h + 2.0, f"{h:.1f}%", ha="center", va="bottom", fontsize=9, fontweight="bold")
+
+    axes[0].set_xticks(x)
+    axes[0].set_xticklabels(res_labels, fontweight="bold")
+    axes[0].set_ylabel("Ocupação do Orçamento da Instância [%]")
+    axes[0].set_title(f"{title_prefix}: Uso de Recursos vs. Limites B_j (DSP = 0)", fontweight="bold")
+    axes[0].set_ylim(0, max(max(u_8b), 115.0) * 1.15)
+    axes[0].grid(True, linestyle=":", alpha=0.5, axis="y")
+    axes[0].legend(loc="upper right")
+
+    # Panel 2: Per-Layer LUT & Bit Allocation Breakdown in KKT Model
+    layers = [item["layer_name"] for item in hw_kkt["breakdown"]]
+    luts_8b = [item["LUT"] for item in hw_8bit["breakdown"]]
+    luts_kkt = [item["LUT"] for item in hw_kkt["breakdown"]]
+    bit_labels = [f"{item['layer_name']}\n(w={item['b_w']}b, a={item['b_a']}b)" for item in hw_kkt["breakdown"]]
+
+    x_l = np.arange(len(layers))
+    b3 = axes[1].bar(x_l - width / 2, luts_8b, width, label="Uniforme (w=8b, a=8b)", color="#1f4e79", alpha=0.75)
+    b4 = axes[1].bar(x_l + width / 2, luts_kkt, width, label="Alocação KKT (w_l*, a_l*)", color="#d95f02", alpha=0.85)
+
+    for bar in b3:
+        h = bar.get_height()
+        axes[1].text(bar.get_x() + bar.get_width() / 2, h + 30.0, f"{h:.0f}", ha="center", va="bottom", fontsize=9)
+    for bar in b4:
+        h = bar.get_height()
+        axes[1].text(bar.get_x() + bar.get_width() / 2, h + 30.0, f"{h:.0f}", ha="center", va="bottom", fontsize=9, fontweight="bold")
+
+    axes[1].set_xticks(x_l)
+    axes[1].set_xticklabels(bit_labels, fontweight="bold")
+    axes[1].set_ylabel("CLB LUTs Consumidas")
+    axes[1].set_title("Consumo de LUTs e Precisão (w_l, a_l) por Camada", fontweight="bold")
+    axes[1].set_ylim(0, max(luts_8b) * 1.18)
+    axes[1].grid(True, linestyle=":", alpha=0.5, axis="y")
+    axes[1].legend(loc="upper right")
 
     plt.tight_layout()
     os.makedirs(os.path.dirname(save_path), exist_ok=True)
@@ -510,6 +590,7 @@ def plot_primal_dual_kkt_evolution(
     iters = [item["iteration"] for item in kkt_history]
     sp_vals = [item["sp_val"] * 100.0 for item in kkt_history]
     lag_costs = [item["lagrangian_cost"] for item in kkt_history]
+    conv_iters = [item["iteration"] for item in kkt_history if item.get("kkt_diagnostics", {}).get("converged", False)]
 
     res_keys = list(kkt_history[0]["mu"].keys())
     colors = {"DSP": "#e7298a", "LUT": "#1f4e79", "FF": "#1b9e77", "BRAM_bits": "#d95f02"}
@@ -524,6 +605,8 @@ def plot_primal_dual_kkt_evolution(
     l2 = ax1_twin.plot(
         iters, lag_costs, color="#d95f02", marker="s", linestyle="--", lw=1.8, label="Custo Lagrangeano L(x, μ)"
     )
+    if conv_iters:
+        ax1.axvline(conv_iters[0], color="forestgreen", linestyle=":", lw=2.0, label=f"Convergência KKT (t={conv_iters[0]})")
     ax1.set_title(f"{title_prefix}: Índice-SP vs. Iteração", fontweight="bold")
     ax1.set_xlabel("Iteração Primal-Dual (t)")
     ax1.set_ylabel("Índice-SP de Validação [%]", color="#1f4e79")
@@ -544,6 +627,8 @@ def plot_primal_dual_kkt_evolution(
             lw=2.0,
             label=f"μ_{rk} (Preço de Sombra)",
         )
+    if conv_iters:
+        ax2.axvline(conv_iters[0], color="forestgreen", linestyle=":", lw=2.0, label=f"Ótimo KKT (t={conv_iters[0]})")
     ax2.set_title("Evolução dos Multiplicadores (μ_j) - VU13P", fontweight="bold")
     ax2.set_xlabel("Iteração Primal-Dual (t)")
     ax2.set_ylabel("Multiplicador Dual (μ_j ≥ 0)")
@@ -562,6 +647,8 @@ def plot_primal_dual_kkt_evolution(
             lw=1.8,
             label=f"g_{rk}(x) [%]",
         )
+    if conv_iters:
+        ax3.axvline(conv_iters[0], color="forestgreen", linestyle=":", lw=2.0)
     ax3.set_title("Viabilidade Primal das Restrições g_j(x) ≤ 0", fontweight="bold")
     ax3.set_xlabel("Iteração Primal-Dual (t)")
     ax3.set_ylabel("Excesso / Folga Relativa ao Orçamento [%]")
