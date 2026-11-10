@@ -190,14 +190,15 @@ cells.append(nbf.v4.new_code_cell(r"""plots_dir = os.path.join(base_dir, "plots"
 plot_files = [
     f"rings_profile_v{VERSION}.png",
     "kkt_primal_dual_evolution.png",
+    "vu13p_resource_utilization.png",
     "learning_curves.png",
     "roc_best_model.png",
+    "roc_duel_fp32_vs_kkt.png",
     "roc_cv_envelope.png",
     "output_scores_hist.png",
     "confusion_matrix_knee.png",
     "cv_boxplots.png",
     "fa_per_fold_workpoints.png",
-    "pareto_and_roc_duel.png",
 ]
 
 for pfile in plot_files:

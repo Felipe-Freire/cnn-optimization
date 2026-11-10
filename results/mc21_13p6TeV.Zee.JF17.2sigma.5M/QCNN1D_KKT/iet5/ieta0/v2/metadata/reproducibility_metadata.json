@@ -1,12 +1,12 @@
 {
-  "timestamp": "2026-11-08T22:10:26.156630",
+  "timestamp": "2026-11-09T22:24:36.520269",
   "dataset_prefix": "mc21_13p6TeV.Zee.JF17.2sigma.5M",
   "model_name": "QCNN1D_KKT",
   "iet": 5,
   "ieta": 0,
   "version": 2,
   "seed": 42,
-  "git_commit": "c2a1ffb29cf7a17c51a2c175919f323d87eca017",
+  "git_commit": "99fdc96c3f05717dc730627fbf1e5b7359ec6a25",
   "python_version": "3.11.18",
   "tensorflow_version": "2.20.0",
   "extra_config": {
@@ -89,14 +89,14 @@
     },
     "hardware_qkeras_kkt": {
       "total_macs": 1376,
-      "total_bops": 42560,
-      "total_weight_bits": 4824,
+      "total_bops": 40832,
+      "total_weight_bits": 4016,
       "total_params": 817,
       "vu13p_resources": {
         "DSP": 0.0,
-        "LUT": 2364.4444444444443,
-        "FF": 5416.0,
-        "BRAM_bits": 4824.0
+        "LUT": 2268.4444444444443,
+        "FF": 4704.0,
+        "BRAM_bits": 4016.0
       },
       "breakdown": [
         {
@@ -104,28 +104,28 @@
           "layer_type": "QConv1D",
           "units": 8,
           "macs": 600,
-          "b_w": 3,
+          "b_w": 2,
           "b_a": 8,
-          "bops": 14400,
+          "bops": 9600,
           "params": 32,
           "DSP": 0.0,
-          "LUT": 800.0,
-          "FF": 396.0,
-          "BRAM_bits": 96.0
+          "LUT": 533.3333333333334,
+          "FF": 364.0,
+          "BRAM_bits": 64.0
         },
         {
           "layer_name": "dense_1",
           "layer_type": "QDense",
           "units": 8,
           "macs": 768,
-          "b_w": 6,
-          "b_a": 6,
-          "bops": 27648,
+          "b_w": 5,
+          "b_a": 8,
+          "bops": 30720,
           "params": 776,
           "DSP": 0.0,
-          "LUT": 1536.0,
-          "FF": 4944.0,
-          "BRAM_bits": 4656.0
+          "LUT": 1706.6666666666667,
+          "FF": 4264.0,
+          "BRAM_bits": 3880.0
         },
         {
           "layer_name": "output_dense",
@@ -144,13 +144,13 @@
       ]
     },
     "holdout_metrics": {
-      "sp": 0.9652406980805953,
-      "pd": 0.9826267340853105,
-      "fa": 0.05199014650589913,
-      "threshold": 0.7872776985168457,
-      "fp32_sp": 0.9758559134853121,
-      "fp32_pd": 0.9865162712303902,
-      "fp32_fa": 0.03474653182937897
+      "sp": 0.9779509702748379,
+      "pd": 0.9836639439906651,
+      "fa": 0.027745364968235448,
+      "threshold": 0.7345957159996033,
+      "fp32_sp": 0.9772984945074752,
+      "fp32_pd": 0.9843122001815118,
+      "fp32_fa": 0.029690133540775314
     }
   }
 }
