@@ -230,22 +230,13 @@ Para resolver o problema sobre o espaço discreto de larguras de bits $(w_l, a_l
 
 ---
 
-## 5. Otimização Bi-Objetivo de Hiperparâmetros (Pareto & TPE)
+## 5. Ciclo Fechado de Otimização em 3 Etapas (QKeras $\to$ SP/VU13P $\to$ Lagrange/KKT)
 
-### 5.1 Abordagem 1: Busca Black-Box com Penalidade Exterior (TPE)
+O pipeline operacional unifica a teoria das Seções 1 a 4 em um ciclo fechado de três estágios iterativos:
 
-A função objetivo escalarizada incorpora o orçamento de hardware como penalidade suave:
-
-$$\min_{\boldsymbol{\theta}} \Phi_\mu(\boldsymbol{\theta}) = -SP(\boldsymbol{\theta}) + \mu \left[ \max\left(0, \frac{\text{BOPs}(\boldsymbol{\theta}) - B}{B}\right) \right]^2$$
-
-O estimador TPE (*Tree-structured Parzen Estimator*) constrói distribuições probabilísticas $p(\boldsymbol{\theta}|y)$ para guiar a busca de filtros, tamanhos de kernel e taxas de aprendizado em direção a regiões viáveis de alto índice $SP$.
-
-### 5.2 Abordagem 2: Fronteira de Pareto com Algoritmo Genético NSGA-II
-
-Na formulação bi-objetivo:
-
-$$\max_{\boldsymbol{\theta}} f_1(\boldsymbol{\theta}) = SP(\boldsymbol{\theta})$$
-
-$$\min_{\boldsymbol{\theta}} f_2(\boldsymbol{\theta}) = \text{BOPs}(\boldsymbol{\theta})$$
-
-O algoritmo **NSGA-II** identifica o conjunto de soluções não dominadas $\mathcal{P}^*$, gerando a curva de *trade-off* explícita entre física e recursos de hardware para escolha do ponto ótimo de síntese em FPGA.
+1. **Estágio 1 — Rede Neural Quantizada (QKeras)**:
+   - Configura as larguras de bits de pesos ($w_l$), ativações ($a_l$) e unidades ($n_l$) nas camadas `QConv1D` e `QDense`, aplicando transferência de pesos (*Warm-Start* QAT) a partir da referência em ponto flutuante e ajuste fino com decaimento adaptativo de taxa de aprendizado (`ReduceLROnPlateau`).
+2. **Estágio 2 — Avaliação de Desempenho Físico e Custo em Silício**:
+   - Avalia o **Índice-$SP$** no joelho da curva ROC de validação para computar a perda física $\mathcal{L}_{\text{SP}}(\mathbf{x}^{(t)}) = 1 - SP_{\text{val}}(\mathbf{x}^{(t)})$ e estima analiticamente o consumo de `DSP`, `LUT`, `FF` e `BRAM_bits` na FPGA **Virtex UltraScale+ VU13P**.
+3. **Estágio 3 — Núcleo de Otimização Lagrange / KKT**:
+   - Compara os recursos consumidos com os tetos de hardware $B_j$ ($g_j(\mathbf{x}^{(t)}) \le 0$), atualiza os **Preços de Sombra** ($\mu_j^{(t+1)}$) via subgradiente dual com projeção de folga complementar, verifica os critérios de parada KKT e calcula analiticamente a próxima alocação de bits $(w_l^{(t+1)}, a_l^{(t+1)})$ via condição de estacionaridade (*water-filling*).
