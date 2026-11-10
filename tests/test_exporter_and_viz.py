@@ -209,21 +209,21 @@ def test_all_visualizations(tmp_path):
     assert os.path.isfile(p9) and os.path.getsize(p9) > 0
 
     hw_8b = {
-        "vu13p_resources": {"DSP": 0.0, "LUT": 4892.0, "FF": 7224.0, "BRAM_bits": 6536.0},
+        "vu13p_resources": {"DSP": 0.0, "LUT": 24500.0, "FF": 8800.0, "BRAM_18K": 1.0},
         "breakdown": [
-            {"layer_name": "conv1d_1", "LUT": 2133.0, "b_w": 8, "b_a": 8},
-            {"layer_name": "dense_1", "LUT": 2730.0, "b_w": 8, "b_a": 8},
-            {"layer_name": "output_dense", "LUT": 28.0, "b_w": 8, "b_a": 8},
+            {"layer_name": "conv1d_1", "LUT": 9500.0, "b_w": 8, "b_a_in": 8},
+            {"layer_name": "dense_1", "LUT": 14800.0, "b_w": 8, "b_a_in": 8},
+            {"layer_name": "output_dense", "LUT": 200.0, "b_w": 8, "b_a_in": 8},
         ],
     }
     hw_kkt = {
-        "vu13p_resources": {"DSP": 0.0, "LUT": 2364.0, "FF": 5416.0, "BRAM_bits": 4824.0},
+        "vu13p_resources": {"DSP": 8.0, "LUT": 10000.0, "FF": 3650.0, "BRAM_18K": 1.0},
         "breakdown": [
-            {"layer_name": "conv1d_1", "LUT": 800.0, "b_w": 3, "b_a": 8},
-            {"layer_name": "dense_1", "LUT": 1536.0, "b_w": 6, "b_a": 6},
-            {"layer_name": "output_dense", "LUT": 28.0, "b_w": 8, "b_a": 8},
+            {"layer_name": "conv1d_1", "LUT": 3200.0, "b_w": 4, "b_a_in": 8},
+            {"layer_name": "dense_1", "LUT": 6600.0, "b_w": 6, "b_a_in": 8},
+            {"layer_name": "output_dense", "LUT": 200.0, "b_w": 16, "b_a_in": 16},
         ],
     }
-    budget = {"DSP": 0.0, "LUT": 2500.0, "FF": 10000.0, "BRAM_bits": 5500.0}
+    budget = {"DSP": 73.7, "LUT": 10368.0, "FF": 20736.0}
     p10 = plot_vu13p_resource_utilization(hw_8b, hw_kkt, budget, save_path=str(tmp_path / "vu13p_res.png"))
     assert os.path.isfile(p10) and os.path.getsize(p10) > 0

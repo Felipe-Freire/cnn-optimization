@@ -52,7 +52,7 @@ assert os.path.isdir(base_dir), f"Diretório não encontrado: {base_dir}"
 """))
 
 # Cell 2: Inspect Reproducibility, VU13P Resources & KKT Allocation Metadata
-cells.append(nbf.v4.new_markdown_cell(r"""## 1. Metadados de Reprodutibilidade, Limites da FPGA VU13P e Alocação Primal-Dual (KKT)
+cells.append(nbf.v4.new_markdown_cell(r"""## 1. Metadados de Reprodutibilidade, Orçamento na VU13P e Alocação Lagrange/KKT
 
 Carregamos `reproducibility_metadata.json` e `kkt_allocation_results.json` da pasta `metadata/`.
 """))
@@ -71,7 +71,14 @@ print(f"  • Timestamp       : {repro_meta['timestamp']}")
 print(f"  • Git Commit      : {repro_meta['git_commit']}")
 print(f"  • Região Cinemática: IET={repro_meta['iet']}, IETA={repro_meta['ieta']} | Versão: v{repro_meta['version']}")
 print(f"  • Estrutura Anéis : {repro_meta['extra_config'].get('rings_structure')}")
-print(f"  • Diagnóstico KKT : {kkt_meta.get('kkt_stopping_diagnostics')}")
+fin = kkt_meta["final"]
+print(f"  • Configuração final: w = {fin['w_bits']}, a = {fin['a_bits']}, entrada = {fin['input_bits']} b")
+print(f"  • Regra de escolha : {fin['selection_rule']} ({fin['sources']})")
+print(f"  • Orçamento B_j    : {kkt_meta['budget']} (hipótese: {kkt_meta['budget_assumption']})")
+for obj, o in kkt_meta["optimization"].items():
+    d = o["dual"]
+    print(f"  • [{obj}] Ω* exato = {o['exact']['omega']:.4g} | dual: LB = {d['lower_bound']:.4g}, UB = {d['upper_bound']:.4g}, "
+          f"gap = {100*d['relative_gap']:.1f}%, μ = {d['mu']}, parada = {d['stop_reason']}")
 
 kkt_rows = []
 hw_q = repro_meta["extra_config"]["hardware_qkeras_kkt"]
@@ -83,19 +90,27 @@ for layer_info in hw_q["breakdown"]:
         "Unidades (n_l)": layer_info.get("units", "-"),
         "Parâmetros": layer_info["params"],
         "MACs": layer_info["macs"],
-        "Bits Contínuos (KKT)": round(kkt_meta["continuous_bits"][lname], 3),
-        "Bits Pesos (w_l)": layer_info["b_w"],
-        "Bits Ativação (a_l)": layer_info["b_a"],
+        "Bits contínuos (water-filling, a=8)": round(kkt_meta["water_filling"]["newton"]["continuous_bits"][lname], 3),
+        "Bits pesos (w_l)": layer_info["b_w"],
+        "Bits entrada (a_in,l)": layer_info["b_a_in"],
         "BOPs": layer_info["bops"],
-        "VU13P DSP": int(layer_info.get("DSP", 0)),
+        "Pesos ≠ 0 [%]": round(100 * layer_info["nonzero_weight_frac"], 1),
+        "VU13P DSP": int(round(layer_info.get("DSP", 0))),
         "VU13P LUT": round(float(layer_info.get("LUT", 0.0)), 1),
         "VU13P FF": round(float(layer_info.get("FF", 0.0)), 1),
-        "VU13P BRAM [bits]": int(layer_info.get("BRAM_bits", 0)),
     })
 
 df_kkt = pd.DataFrame(kkt_rows)
 print("\n=== Tabela de Quantização por Camada e Recursos na FPGA Virtex UltraScale+ VU13P ===")
 display(df_kkt)
+print("Recursos totais estimados (modelo calibrado):", hw_q["vu13p_resources"])
+
+print("\n=== Candidatos do ciclo fechado (QAT, SP de validação) ===")
+df_cand = pd.DataFrame(kkt_meta["closed_loop_candidates"])
+display(df_cand.sort_values("LUT").round(5))
+
+print("\n=== Calibração do modelo de custo (sínteses hls4ml + Vivado) ===")
+display(pd.DataFrame(kkt_meta["cost_model"]["calibration"]).round(3))
 """))
 
 # Cell 3: Cross-Validation Results Table
@@ -146,7 +161,7 @@ Verificamos as predições brutas armazenadas em disco nos pontos de operação 
 """))
 
 cells.append(nbf.v4.new_code_cell(r"""from sklearn.metrics import roc_curve
-from src.metrics import compute_sp_with_threshold
+from src.metrics import compute_sp_with_threshold, sp_at_threshold
 
 preds_npz = np.load(os.path.join(base_dir, "evaluation", "holdout_predictions.npz"))
 y_true_ho = preds_npz["y_true"]
@@ -154,6 +169,9 @@ y_pred_ho = preds_npz["y_pred"]
 saved_thresh = float(preds_npz["threshold"][0])
 
 sp_ho, pd_ho, fa_ho, thresh_ho, _ = compute_sp_with_threshold(y_true_ho, y_pred_ho)
+sp_fix, pd_fix, fa_fix = sp_at_threshold(y_true_ho, y_pred_ho, saved_thresh)
+print(f"Holdout no limiar salvo (escolhido na validação, {saved_thresh:.4f}): SP = {sp_fix*100:.2f}% | PD = {pd_fix*100:.2f}% | FA = {fa_fix*100:.2f}%")
+print(f"Holdout no joelho do próprio holdout (otimista, só referência): SP = {sp_ho*100:.2f}% | limiar {thresh_ho:.4f}")
 fa_curve, pd_curve, thresholds = roc_curve(y_true_ho, y_pred_ho)
 
 wp_targets = [
@@ -183,13 +201,16 @@ display(df_wp)
 # Cell 5: Gallery of Plots from plots/
 cells.append(nbf.v4.new_markdown_cell(r"""## 4. Galeria Completa de Visualizações (`plots/`)
 
-Exibimos todas as 10 figuras científicas geradas na pasta `plots/` do experimento, incluindo a evolução Primal-Dual KKT e os Multiplicadores de Lagrange ($\mu_j$).
+Exibimos as figuras geradas na pasta `plots/` do experimento, incluindo a evolução Primal-Dual KKT e os Multiplicadores de Lagrange ($\mu_j$).
 """))
 
 cells.append(nbf.v4.new_code_cell(r"""plots_dir = os.path.join(base_dir, "plots")
 plot_files = [
     f"rings_profile_v{VERSION}.png",
+    "sensitivity_validation.png",
     "kkt_primal_dual_evolution.png",
+    "kkt_primal_dual_evolution_measured.png",
+    "pareto_sp_vs_lut.png",
     "vu13p_resource_utilization.png",
     "learning_curves.png",
     "roc_best_model.png",

@@ -503,163 +503,170 @@ def plot_roc_duel_fp32_vs_kkt(
     return save_path
 
 
-def plot_vu13p_resource_utilization(
-    hw_8bit: Dict[str, Any],
-    hw_kkt: Dict[str, Any],
-    vu13p_budget: Dict[str, float],
-    save_path: str,
-    title_prefix: str = "Virtex UltraScale+ VU13P",
-    show: bool = False,
-) -> str:
-    """Plots VU13P resource consumption (% of instance budget) and per-layer LUT/BRAM breakdown."""
-    set_academic_style()
-    fig, axes = plt.subplots(1, 2, figsize=(14.5, 5.2))
+# Categorical slots (validated reference palette, light mode): fixed order, never cycled.
+SERIES_COLORS = ["#2a78d6", "#eb6834", "#1baf7a", "#eda100", "#e87ba4"]
+INK, INK2, GRID = "#0b0b0b", "#52514e", "#e4e3df"
+RESOURCE_LABELS = {"DSP": "DSP48E2", "LUT": "CLB LUTs", "FF": "CLB flip-flops", "BRAM_18K": "RAMB18"}
 
-    # Panel 1: Resource Utilization (% of Instance Budget B_j) for LUT, FF, BRAM_bits
-    res_keys = ["LUT", "FF", "BRAM_bits"]
-    res_labels = ["CLB LUTs", "CLB Flip-Flops", "Block RAM [bits]"]
 
-    u_8b = [hw_8bit["vu13p_resources"][k] / max(vu13p_budget[k], 1.0) * 100.0 for k in res_keys]
-    u_kkt = [hw_kkt["vu13p_resources"][k] / max(vu13p_budget[k], 1.0) * 100.0 for k in res_keys]
+def _clean_axes(ax) -> None:
+    ax.grid(True, axis="y", color=GRID, linewidth=0.8)
+    ax.set_axisbelow(True)
+    ax.tick_params(colors=INK2)
 
-    x = np.arange(len(res_keys))
-    width = 0.35
 
-    b1 = axes[0].bar(x - width / 2, u_8b, width, label="Uniforme 8-bit (Inviável em LUT/BRAM)", color="#a33030", alpha=0.8)
-    b2 = axes[0].bar(x + width / 2, u_kkt, width, label="Otimizado Lagrange/KKT (Viável ≤ 100%)", color="#1b9e77", alpha=0.85)
-    axes[0].axhline(100.0, color="black", linestyle="--", lw=1.8, label="Limite de Orçamento VU13P (100%)")
-
-    for bar in b1:
-        h = bar.get_height()
-        axes[0].text(bar.get_x() + bar.get_width() / 2, h + 2.0, f"{h:.1f}%", ha="center", va="bottom", fontsize=9, fontweight="bold")
-    for bar in b2:
-        h = bar.get_height()
-        axes[0].text(bar.get_x() + bar.get_width() / 2, h + 2.0, f"{h:.1f}%", ha="center", va="bottom", fontsize=9, fontweight="bold")
-
-    axes[0].set_xticks(x)
-    axes[0].set_xticklabels(res_labels, fontweight="bold")
-    axes[0].set_ylabel("Ocupação do Orçamento da Instância [%]")
-    axes[0].set_title(f"{title_prefix}: Uso de Recursos vs. Limites B_j (DSP = 0)", fontweight="bold")
-    axes[0].set_ylim(0, max(max(u_8b), 115.0) * 1.15)
-    axes[0].grid(True, linestyle=":", alpha=0.5, axis="y")
-    axes[0].legend(loc="upper right")
-
-    # Panel 2: Per-Layer LUT & Bit Allocation Breakdown in KKT Model
-    layers = [item["layer_name"] for item in hw_kkt["breakdown"]]
-    luts_8b = [item["LUT"] for item in hw_8bit["breakdown"]]
-    luts_kkt = [item["LUT"] for item in hw_kkt["breakdown"]]
-    bit_labels = [f"{item['layer_name']}\n(w={item['b_w']}b, a={item['b_a']}b)" for item in hw_kkt["breakdown"]]
-
-    x_l = np.arange(len(layers))
-    b3 = axes[1].bar(x_l - width / 2, luts_8b, width, label="Uniforme (w=8b, a=8b)", color="#1f4e79", alpha=0.75)
-    b4 = axes[1].bar(x_l + width / 2, luts_kkt, width, label="Alocação KKT (w_l*, a_l*)", color="#d95f02", alpha=0.85)
-
-    for bar in b3:
-        h = bar.get_height()
-        axes[1].text(bar.get_x() + bar.get_width() / 2, h + 30.0, f"{h:.0f}", ha="center", va="bottom", fontsize=9)
-    for bar in b4:
-        h = bar.get_height()
-        axes[1].text(bar.get_x() + bar.get_width() / 2, h + 30.0, f"{h:.0f}", ha="center", va="bottom", fontsize=9, fontweight="bold")
-
-    axes[1].set_xticks(x_l)
-    axes[1].set_xticklabels(bit_labels, fontweight="bold")
-    axes[1].set_ylabel("CLB LUTs Consumidas")
-    axes[1].set_title("Consumo de LUTs e Precisão (w_l, a_l) por Camada", fontweight="bold")
-    axes[1].set_ylim(0, max(luts_8b) * 1.18)
-    axes[1].grid(True, linestyle=":", alpha=0.5, axis="y")
-    axes[1].legend(loc="upper right")
-
+def _save(fig, save_path: str, show: bool) -> str:
     plt.tight_layout()
-    os.makedirs(os.path.dirname(save_path), exist_ok=True)
+    os.makedirs(os.path.dirname(save_path) or ".", exist_ok=True)
     fig.savefig(save_path, dpi=300, bbox_inches="tight")
     if show:
         plt.show()
     else:
         plt.close(fig)
     return save_path
+
+
+def plot_vu13p_resource_utilization(
+    hw_ref: Dict[str, Any],
+    hw_opt: Dict[str, Any],
+    vu13p_budget: Dict[str, float],
+    save_path: str,
+    labels: Tuple[str, str] = ("Uniforme 8 bits", "Lagrange/KKT"),
+    title_prefix: str = "Virtex UltraScale+ VU13P",
+    show: bool = False,
+) -> str:
+    """Budget occupancy (calibrated cost model) of a reference and an optimized configuration, plus LUTs per layer."""
+    set_academic_style()
+    fig, axes = plt.subplots(1, 2, figsize=(14.5, 5.2))
+    keys = [k for k in ("DSP", "LUT", "FF") if k in vu13p_budget]
+    x = np.arange(len(keys))
+    width = 0.36
+    for j, (hw, lab) in enumerate(zip((hw_ref, hw_opt), labels)):
+        occ = [hw["vu13p_resources"][k] / max(vu13p_budget[k], 1.0) * 100.0 for k in keys]
+        bars = axes[0].bar(x + (j - 0.5) * width, occ, width - 0.02, label=lab, color=SERIES_COLORS[j])
+        for bar, v in zip(bars, occ):
+            axes[0].text(bar.get_x() + bar.get_width() / 2, v, f"{v:.0f}%", ha="center", va="bottom", fontsize=9, color=INK)
+    axes[0].axhline(100.0, color=INK2, linestyle="--", lw=1.2, label="Orçamento B_j (100%)")
+    axes[0].set_xticks(x, [RESOURCE_LABELS[k] for k in keys])
+    axes[0].set_ylabel("Ocupação do orçamento da instância [%]")
+    axes[0].set_title(f"{title_prefix}: uso estimado (modelo calibrado) vs. B_j")
+    axes[0].legend(frameon=False)
+    _clean_axes(axes[0])
+
+    names = [b["layer_name"] for b in hw_opt["breakdown"]]
+    xl = np.arange(len(names))
+    for j, (hw, lab) in enumerate(zip((hw_ref, hw_opt), labels)):
+        luts = [b["LUT"] for b in hw["breakdown"]]
+        axes[1].bar(xl + (j - 0.5) * width, luts, width - 0.02, label=lab, color=SERIES_COLORS[j])
+    ticks = [f"{b['layer_name']}\n(w={b['b_w']}b, a_in={b['b_a_in']}b)" for b in hw_opt["breakdown"]]
+    axes[1].set_xticks(xl, ticks)
+    axes[1].set_ylabel("CLB LUTs (parte atribuível à camada)")
+    axes[1].set_title("LUTs por camada e precisão da configuração otimizada")
+    axes[1].legend(frameon=False)
+    _clean_axes(axes[1])
+    return _save(fig, save_path, show)
 
 
 def plot_primal_dual_kkt_evolution(
     kkt_history: List[Dict[str, Any]],
     save_path: str,
+    exact_optimum: Optional[float] = None,
     title_prefix: str = "Virtex UltraScale+ VU13P",
     show: bool = False,
 ) -> str:
-    """Plots Primal-Dual Lagrange-KKT optimization trajectory (SP-Index, Shadow Prices mu_j, and Constraints g_j)."""
+    """Dual decomposition trajectory: bounds on Omega*, shadow prices mu_j and constraints g_j(x(mu_t))."""
     set_academic_style()
-    iters = [item["iteration"] for item in kkt_history]
-    sp_vals = [item["sp_val"] * 100.0 for item in kkt_history]
-    lag_costs = [item["lagrangian_cost"] for item in kkt_history]
-    conv_iters = [item["iteration"] for item in kkt_history if item.get("kkt_diagnostics", {}).get("converged", False)]
-
+    it = [h["iteration"] for h in kkt_history]
     res_keys = list(kkt_history[0]["mu"].keys())
-    colors = {"DSP": "#e7298a", "LUT": "#1f4e79", "FF": "#1b9e77", "BRAM_bits": "#d95f02"}
-    markers = {"DSP": "^", "LUT": "o", "FF": "s", "BRAM_bits": "D"}
-
     fig, axes = plt.subplots(1, 3, figsize=(16.5, 4.8))
 
-    # 1. SP-Index & Lagrangian Objective Evolution
-    ax1 = axes[0]
-    ax1_twin = ax1.twinx()
-    l1 = ax1.plot(iters, sp_vals, color="#1f4e79", marker="o", lw=2.2, label="Índice-SP Val [%]")
-    l2 = ax1_twin.plot(
-        iters, lag_costs, color="#d95f02", marker="s", linestyle="--", lw=1.8, label="Custo Lagrangeano L(x, μ)"
-    )
-    if conv_iters:
-        ax1.axvline(conv_iters[0], color="forestgreen", linestyle=":", lw=2.0, label=f"Convergência KKT (t={conv_iters[0]})")
-    ax1.set_title(f"{title_prefix}: Índice-SP vs. Iteração", fontweight="bold")
-    ax1.set_xlabel("Iteração Primal-Dual (t)")
-    ax1.set_ylabel("Índice-SP de Validação [%]", color="#1f4e79")
-    ax1_twin.set_ylabel("Custo Lagrangeano L(x, μ)", color="#d95f02")
-    ax1.grid(True, linestyle=":", alpha=0.5)
-    lines = l1 + l2
-    labels = [l.get_label() for l in lines]
-    ax1.legend(lines, labels, loc="center right")
+    ax = axes[0]
+    ax.plot(it, [h["upper_bound"] for h in kkt_history], color=SERIES_COLORS[0], lw=2, label="Melhor primal viável (UB)")
+    ax.plot(it, [h["lower_bound"] for h in kkt_history], color=SERIES_COLORS[1], lw=2, label="Limite dual max q(μ) (LB)")
+    if exact_optimum is not None:
+        ax.axhline(exact_optimum, color=INK2, linestyle="--", lw=1.2, label="Ótimo exato (enumeração)")
+    ax.set_title(f"{title_prefix}: limites de Ω*")
+    ax.set_xlabel("Iteração t")
+    ax.set_ylabel("Ω (aumento de perda previsto)")
+    ax.legend(frameon=False)
+    _clean_axes(ax)
 
-    # 2. Evolution of Lagrange Multipliers (Shadow Prices mu_j)
-    ax2 = axes[1]
-    for rk in res_keys:
-        mu_series = [item["mu"][rk] for item in kkt_history]
-        ax2.plot(
-            iters, mu_series,
-            marker=markers.get(rk, "o"),
-            color=colors.get(rk, "black"),
-            lw=2.0,
-            label=f"μ_{rk} (Preço de Sombra)",
-        )
-    if conv_iters:
-        ax2.axvline(conv_iters[0], color="forestgreen", linestyle=":", lw=2.0, label=f"Ótimo KKT (t={conv_iters[0]})")
-    ax2.set_title("Evolução dos Multiplicadores (μ_j) - VU13P", fontweight="bold")
-    ax2.set_xlabel("Iteração Primal-Dual (t)")
-    ax2.set_ylabel("Multiplicador Dual (μ_j ≥ 0)")
-    ax2.grid(True, linestyle=":", alpha=0.5)
-    ax2.legend(loc="best")
+    for j, rk in enumerate(res_keys):
+        axes[1].plot(it, [h["mu"][rk] for h in kkt_history], color=SERIES_COLORS[j], lw=2, label=f"μ_{rk}")
+        axes[2].plot(it, [100.0 * h["g"][rk] for h in kkt_history], color=SERIES_COLORS[j], lw=1.5, label=f"g_{rk}")
+    axes[1].set_title("Preços-sombra μ_j ≥ 0")
+    axes[1].set_xlabel("Iteração t")
+    axes[1].set_ylabel("μ_j [Ω por unidade de B_j]")
+    axes[1].legend(frameon=False)
+    _clean_axes(axes[1])
+    axes[2].axhline(0.0, color=INK2, linestyle="--", lw=1.2)
+    axes[2].set_yscale("symlog", linthresh=10.0)  # early DSP excursions reach >1000 %; keep |g| < 10 % linear
+    axes[2].set_title("Restrições g_j(x(μ_t)) (≤ 0 é viável)")
+    axes[2].set_xlabel("Iteração t")
+    axes[2].set_ylabel("(R_j − B_j)/B_j [%] (escala symlog)")
+    axes[2].legend(frameon=False)
+    _clean_axes(axes[2])
+    return _save(fig, save_path, show)
 
-    # 3. Normalized Constraint Violations g_j(x) <= 0
-    ax3 = axes[2]
-    ax3.axhline(0.0, color="crimson", linestyle="--", lw=1.8, label="Limite Viável (g_j = 0)")
-    for rk in res_keys:
-        g_series = [item["g_val"][rk] * 100.0 for item in kkt_history]
-        ax3.plot(
-            iters, g_series,
-            marker=markers.get(rk, "o"),
-            color=colors.get(rk, "black"),
-            lw=1.8,
-            label=f"g_{rk}(x) [%]",
-        )
-    if conv_iters:
-        ax3.axvline(conv_iters[0], color="forestgreen", linestyle=":", lw=2.0)
-    ax3.set_title("Viabilidade Primal das Restrições g_j(x) ≤ 0", fontweight="bold")
-    ax3.set_xlabel("Iteração Primal-Dual (t)")
-    ax3.set_ylabel("Excesso / Folga Relativa ao Orçamento [%]")
-    ax3.grid(True, linestyle=":", alpha=0.5)
-    ax3.legend(loc="best")
 
-    plt.tight_layout()
-    os.makedirs(os.path.dirname(save_path), exist_ok=True)
-    fig.savefig(save_path, dpi=300, bbox_inches="tight")
-    if show:
-        plt.show()
-    else:
-        plt.close(fig)
-    return save_path
+def plot_sensitivity_validation(
+    omega_hessian: Dict[str, Dict[int, float]],
+    measured: Dict[str, Dict[int, float]],
+    save_path: str,
+    noise_floor: float = 1e-5,
+    show: bool = False,
+) -> str:
+    """Hessian (2nd-order Taylor) prediction vs measured loss increase, one panel per quantized tensor."""
+    set_academic_style()
+    names = list(omega_hessian)
+    fig, axes = plt.subplots(1, len(names), figsize=(3.4 * len(names), 3.8), sharey=True)
+    for ax, name in zip(np.atleast_1d(axes), names):
+        bits = sorted(omega_hessian[name])
+        ax.axhspan(1e-9, noise_floor, color=GRID, alpha=0.6, lw=0)
+        ax.plot(bits, [max(omega_hessian[name][b], 1e-9) for b in bits], marker="o", color=SERIES_COLORS[0],
+                lw=2, label="Ω Hessiana (Taylor)")
+        ax.plot(bits, [max(measured[name][b], 1e-9) for b in bits], marker="s", color=SERIES_COLORS[1],
+                lw=2, label="ΔL medido (PTQ)")
+        ax.set_yscale("log")
+        ax.set_xticks([b for b in bits if b in (2, 4, 6, 8, 12, 16)])
+        ax.set_title(name, fontsize=11)
+        ax.set_xlabel("bits")
+        _clean_axes(ax)
+    first = np.atleast_1d(axes)[0]
+    first.set_ylabel("aumento da perda BCE")
+    first.legend(frameon=False, fontsize=9)
+    first.text(0.03, 0.03, f"faixa cinza: ΔL < {noise_floor:.0e} (ruído; ≤ 0 desenhado em 1e-9)",
+               transform=first.transAxes, fontsize=7.5, color=INK2)
+    return _save(fig, save_path, show)
+
+
+def plot_pareto_frontier(
+    frontier: pd.DataFrame,
+    uniform: pd.DataFrame,
+    lut_budget: float,
+    save_path: str,
+    fp32_sp: Optional[float] = None,
+    budget_label: str = "B_LUT da instância",
+    show: bool = False,
+) -> str:
+    """Validation SP after QAT vs estimated LUTs: mixed-precision frontier (per objective) vs uniform bits."""
+    set_academic_style()
+    fig, ax = plt.subplots(1, 1, figsize=(9, 5))
+    for j, (obj, grp) in enumerate(frontier.groupby("objective", sort=False)):
+        grp = grp.sort_values("LUT")
+        ax.plot(grp["LUT"], 100 * grp["sp_val"], marker="o", lw=2, color=SERIES_COLORS[j], label=f"Precisão mista ({obj})")
+    u = uniform.sort_values("LUT")
+    ax.plot(u["LUT"], 100 * u["sp_val"], marker="s", lw=2, color=SERIES_COLORS[2], label="Uniforme (w = a)")
+    for _, r in u.iterrows():
+        ax.annotate(f"u{int(r['bits'])}", (r["LUT"], 100 * r["sp_val"]), textcoords="offset points", xytext=(4, -12),
+                    fontsize=8, color=INK2)
+    ax.axvline(lut_budget, color=INK2, linestyle="--", lw=1.2, label=budget_label)
+    if fp32_sp is not None:
+        ax.axhline(100 * fp32_sp, color=INK2, linestyle=":", lw=1.2, label="FP32 (referência)")
+    ax.set_xscale("log")
+    ax.set_xlabel("LUTs estimadas na VU13P (modelo calibrado, pesos após QAT)")
+    ax.set_ylabel("SP de validação após QAT [%]")
+    ax.set_title("Fronteira SP × custo: alocação ótima vs. quantização uniforme")
+    ax.legend(frameon=False, fontsize=9)
+    _clean_axes(ax)
+    return _save(fig, save_path, show)

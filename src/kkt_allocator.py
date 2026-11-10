@@ -1,402 +1,486 @@
-"""Mixed-precision bit allocation via Hessian sensitivity and Karush-Kuhn-Tucker (KKT) on VU13P."""
+"""Mixed-precision bit allocation on the VU13P: KKT water-filling, exact discrete solution and
+Lagrangian dual decomposition (primal-dual with shadow prices). See docs/theory_and_formulation.md.
 
-from typing import Any, Callable, Dict, List, Optional, Tuple
+Problem (proxy of 1 - SP, Sec. 3-4 of the theory doc):
+
+    min_x  Omega(x) = sum_l Omega^w_l(w_l) + sum_m Omega^a_m(a_m)
+    s.t.   g_j(x) = (R_j(x) - B_j) / B_j <= 0,     j in {DSP, LUT, FF}
+           w_l, a_m in a finite set of bit widths
+
+with R_j from the calibrated cost model (src.hardware). Layer l's cost depends on (w_l, a_in,l),
+where a_in,l is the ReLU precision of the previous layer, so grouping each compute layer with the
+activation that feeds it makes both Omega and R separable over "choice groups". Then:
+
+* ``solve_exact``: enumeration of all combinations (the design space is small) -> global optimum,
+  ground truth for the other methods;
+* ``LagrangianDualAllocator``: for fixed shadow prices mu the Lagrangian minimization splits into
+  independent per-group argmins (exact primal step); mu follows projected subgradient ascent on the
+  concave dual function q(mu) (Polyak step). It reports the dual bound, the best feasible primal and
+  the duality gap, and certifies optimality only when the Lagrangian sufficient conditions hold;
+* ``solve_kkt_bit_allocation``: the continuous relaxation (weights only, linear cost) solved in closed
+  form by water-filling, with bisection or safeguarded Newton on t = log2(lambda).
+
+This replaces ``LagrangeKKTQuantizerOptimizer`` / ``check_kkt_stopping_criteria``, whose primal step
+did not minimize the Lagrangian (hard-coded budget factors and bit rules) and whose multiplier decay
+enforced complementary slackness artificially.
+"""
+
+from dataclasses import dataclass
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
+
 import numpy as np
-import tensorflow as tf
+
+from src.hardware import CONSTRAINED_RESOURCES
+
+# ============================================================================ continuous relaxation
 
 
-def compute_hutchinson_hessian_trace(
-    model: tf.keras.Model,
-    loss_fn: tf.keras.losses.Loss,
-    x_batch: tf.Tensor,
-    y_batch: tf.Tensor,
-    num_hvp: int = 10,
-    seed: int = 42,
-) -> Dict[str, float]:
-    """Estimate the trace of the Hessian for each layer's weights using Hutchinson's algorithm.
-
-    Tr(H_i) ~ (1 / M) * sum_j [ z_j^T * H_i * z_j ]
-    where z_j is a random Rademacher vector (elements in {-1, +1}).
-
-    Args:
-        model: Trained tf.keras.Model.
-        loss_fn: Loss function (e.g. BinaryCrossentropy).
-        x_batch: Sample batch of input features.
-        y_batch: Corresponding ground-truth labels.
-        num_hvp: Number of Hessian-Vector Products (Monte Carlo evaluations).
-        seed: Random seed for Rademacher vectors.
-
-    Returns:
-        Dictionary mapping layer name to its estimated Hessian trace Tr(H_i).
-    """
-    np.random.seed(seed)
-    target_layers = [l for l in model.layers if hasattr(l, "kernel") and l.kernel is not None]
-    trainable_vars = [l.kernel for l in target_layers]
-    layer_names = [l.name for l in target_layers]
-    var_traces = {name: 0.0 for name in layer_names}
-
-    for _ in range(num_hvp):
-        v_list = []
-        for var in trainable_vars:
-            rademacher = np.random.choice([-1.0, 1.0], size=var.shape).astype(np.float32)
-            v_list.append(tf.convert_to_tensor(rademacher))
-
-        with tf.GradientTape() as outer_tape:
-            with tf.GradientTape() as inner_tape:
-                y_pred = model(x_batch, training=False)
-                loss = loss_fn(y_batch, y_pred)
-
-            grads = inner_tape.gradient(loss, trainable_vars)
-            gv_products = [tf.reduce_sum(g * v) for g, v in zip(grads, v_list) if g is not None]
-            total_gv = tf.add_n(gv_products)
-
-        hvps = outer_tape.gradient(total_gv, trainable_vars)
-
-        for name, v, hvp in zip(layer_names, v_list, hvps):
-            if hvp is not None:
-                quad_form = tf.reduce_sum(v * hvp).numpy()
-                var_traces[name] += float(quad_form) / num_hvp
-
-    return {k: max(1e-8, v) for k, v in var_traces.items()}
-
-
-def compute_layer_c_coefficients(
-    model: tf.keras.Model,
-    traces: Dict[str, float],
-) -> Dict[str, float]:
-    """Compute perturbation sensitivity coefficients: c_i = Tr(H_i) * (n_i * r_i^2) / 3.
-
-    Args:
-        model: Trained model.
-        traces: Estimated Hessian trace per layer.
-
-    Returns:
-        Dictionary mapping layer name to c_i coefficient.
-    """
-    c_coeffs = {}
-    for layer in model.layers:
-        if layer.name in traces and hasattr(layer, "kernel") and layer.kernel is not None:
-            weights = layer.kernel.numpy()
-            n_i = weights.size
-            r_i = float(np.max(np.abs(weights))) + 1e-6
-            tr_h = traces[layer.name]
-            c_i = tr_h * (n_i * (r_i ** 2)) / 3.0
-            c_coeffs[layer.name] = float(c_i)
-    return c_coeffs
+def _water_level_bits(c, a, t, b_min, b_max):
+    """b_i(t) = clip(1/2 log2(c_i ln4 / a_i) - t/2, b_min, b_max) with t = log2(lambda)."""
+    raw = 0.5 * np.log2(c * np.log(4.0) / a) - 0.5 * t
+    return np.clip(raw, b_min, b_max), raw
 
 
 def solve_kkt_bit_allocation(
-    layer_names: List[str],
-    c_coeffs: List[float],
-    a_costs: List[float],
+    layer_names: Sequence[str],
+    c_coeffs: Sequence[float],
+    a_costs: Sequence[float],
     budget_bops: float,
     b_min: int = 2,
     b_max: int = 8,
-    tol: float = 1e-5,
-    max_iter: int = 100,
+    tol: float = 1e-9,
+    max_iter: int = 200,
+    method: str = "bisection",
 ) -> Dict[str, Any]:
-    """Analytical Karush-Kuhn-Tucker (KKT) water-filling bit allocation under BOPs budget.
+    """Water-filling solution of  min sum c_i 4^-b_i  s.t.  sum a_i b_i <= B,  b_min <= b_i <= b_max.
 
-    Minimizes: sum_i [ c_i * 4^(-b_i) ]
-    Subject to: sum_i [ a_i * b_i ] <= budget_bops, and b_min <= b_i <= b_max
-
-    Stationarity gives: b_i*(lambda) = clip( 0.5 * log2( (c_i * ln 4) / (lambda * a_i) ), b_min, b_max )
+    Stationarity: b_i*(lambda) = clip(1/2 log2(c_i ln4 / (lambda a_i)), b_min, b_max); lambda* solves
+    h(lambda) = sum a_i b_i*(lambda) - B = 0 (h non-increasing). With t = log2 lambda, h is piecewise
+    linear with slope -1/2 sum_{interior} a_i, so Newton is exact on each linear piece; it is
+    safeguarded by a bisection bracket. The integer solution is floor + greedy fill of the leftover
+    budget by marginal efficiency dOmega/da (compare with the exact discrete solvers).
     """
-    c = np.array(c_coeffs, dtype=np.float64)
-    a = np.array(a_costs, dtype=np.float64)
-    ln4 = np.log(4.0)
+    c = np.maximum(np.asarray(c_coeffs, dtype=np.float64), 1e-300)
+    a = np.asarray(a_costs, dtype=np.float64)
+    if np.any(a <= 0):
+        raise ValueError("a_costs must be positive")
+    min_cost, max_cost = float(np.sum(a * b_min)), float(np.sum(a * b_max))
+    if budget_bops < min_cost - 1e-9:
+        raise ValueError(f"Budget {budget_bops} below the minimum cost {min_cost} (all layers at {b_min} bits).")
 
-    min_bops = np.sum(a * b_min)
-    max_bops = np.sum(a * b_max)
+    if budget_bops >= max_cost:
+        cont = np.full_like(a, float(b_max))
+        integer_b = np.full(a.shape, b_max, dtype=int)
+        lam, t_star, iters, active = 0.0, -np.inf, 0, False
+    else:
+        def h(t):
+            return float(np.sum(a * _water_level_bits(c, a, t, b_min, b_max)[0]) - budget_bops)
 
-    if budget_bops >= max_bops:
-        continuous_b = np.full_like(a, b_max)
-        integer_b = np.full_like(a, b_max, dtype=int)
-        return {
-            "lambda_optimal": 0.0,
-            "continuous_bits": {name: float(b) for name, b in zip(layer_names, continuous_b)},
-            "integer_bits": {name: int(b) for name, b in zip(layer_names, integer_b)},
-            "achieved_bops": float(np.sum(a * integer_b)),
-            "budget_bops": budget_bops,
-            "budget_active": False,
-        }
+        # bracket: h(lo) > 0 (bits towards b_max), h(hi) <= 0 (bits towards b_min)
+        lo, hi = -10.0, 10.0
+        while h(lo) <= 0:
+            lo -= 10.0
+        while h(hi) > 0:
+            hi += 10.0
+        t = 0.5 * (lo + hi)
+        iters = 0
+        for iters in range(1, max_iter + 1):
+            val = h(t)
+            if abs(val) <= tol * max(1.0, budget_bops):
+                break
+            if val > 0:
+                lo = t
+            else:
+                hi = t
+            t_next = 0.5 * (lo + hi)
+            if method == "newton":
+                _, raw = _water_level_bits(c, a, t, b_min, b_max)
+                interior = (raw > b_min) & (raw < b_max)
+                slope = -0.5 * float(np.sum(a[interior]))
+                if slope < 0:
+                    cand = t - val / slope
+                    if lo < cand < hi:
+                        t_next = cand
+            elif method != "bisection":
+                raise ValueError(f"unknown method {method!r}")
+            t = t_next
+        t_star, lam, active = t, float(2.0 ** t), True
+        cont, _ = _water_level_bits(c, a, t_star, b_min, b_max)
 
-    if budget_bops < min_bops:
-        raise ValueError(
-            f"Budget {budget_bops} is strictly lower than minimum viable hardware cost {min_bops} (all layers at {b_min} bits)."
-        )
+        integer_b = np.clip(np.floor(cont + 1e-9).astype(int), b_min, b_max)
+        spent = float(np.sum(a * integer_b))
+        while True:
+            gains = np.where(
+                (integer_b < b_max) & (spent + a <= budget_bops + 1e-9),
+                c * (4.0 ** (-integer_b) - 4.0 ** (-(integer_b + 1))) / a,
+                -np.inf,
+            )
+            i = int(np.argmax(gains))
+            if not np.isfinite(gains[i]):
+                break
+            integer_b[i] += 1
+            spent += a[i]
 
-    def get_bits(lam: float) -> np.ndarray:
-        if lam <= 0:
-            return np.full_like(a, b_max)
-        raw_b = 0.5 * np.log2((c * ln4) / (lam * a + 1e-12))
-        return np.clip(raw_b, b_min, b_max)
-
-    def h_budget(lam: float) -> float:
-        return float(np.sum(a * get_bits(lam)) - budget_bops)
-
-    lam_low = 1e-9
-    lam_high = 1e4
-
-    while h_budget(lam_low) < 0:
-        lam_low /= 10.0
-    while h_budget(lam_high) > 0:
-        lam_high *= 10.0
-
-    lam_mid = 0.5 * (lam_low + lam_high)
-    for _ in range(max_iter):
-        lam_mid = 0.5 * (lam_low + lam_high)
-        val = h_budget(lam_mid)
-        if abs(val) < tol:
-            break
-        if val > 0:
-            lam_low = lam_mid
+    # KKT residuals of the continuous solution (Lagrangian with lambda, nu-, nu+)
+    grad = -c * np.log(4.0) * 4.0 ** (-cont) + lam * a
+    kkt = {}
+    for name, bi, gi in zip(layer_names, cont, grad):
+        if bi <= b_min + 1e-9:
+            kkt[name] = {"bound": "lower", "nu_lower": float(gi), "stationarity_residual": 0.0}
+        elif bi >= b_max - 1e-9:
+            kkt[name] = {"bound": "upper", "nu_upper": float(-gi), "stationarity_residual": 0.0}
         else:
-            lam_high = lam_mid
-
-    optimal_continuous_b = get_bits(lam_mid)
-
-    floor_b = np.floor(optimal_continuous_b).astype(int)
-    floor_b = np.clip(floor_b, b_min, b_max)
-    current_bops = np.sum(a * floor_b)
-
-    integer_b = floor_b.copy()
-    while True:
-        best_layer = -1
-        best_efficiency = -1.0
-        for i in range(len(integer_b)):
-            if integer_b[i] < b_max and (current_bops + a[i] <= budget_bops):
-                delta_loss = c[i] * (4.0 ** (-integer_b[i]) - 4.0 ** (-(integer_b[i] + 1)))
-                efficiency = delta_loss / (a[i] + 1e-8)
-                if efficiency > best_efficiency:
-                    best_efficiency = efficiency
-                    best_layer = i
-
-        if best_layer != -1:
-            integer_b[best_layer] += 1
-            current_bops += a[best_layer]
-        else:
-            break
-
+            kkt[name] = {"bound": "interior", "stationarity_residual": float(gi)}
     return {
-        "lambda_optimal": float(lam_mid),
-        "continuous_bits": {name: float(b) for name, b in zip(layer_names, optimal_continuous_b)},
-        "integer_bits": {name: int(b) for name, b in zip(layer_names, integer_b)},
+        "method": method,
+        "iterations": int(iters),
+        "lambda_optimal": float(lam),
+        "continuous_bits": {n: float(b) for n, b in zip(layer_names, cont)},
+        "integer_bits": {n: int(b) for n, b in zip(layer_names, integer_b)},
         "achieved_bops": float(np.sum(a * integer_b)),
-        "budget_bops": budget_bops,
-        "budget_active": True,
+        "continuous_cost": float(np.sum(a * cont)),
+        "budget_bops": float(budget_bops),
+        "budget_active": bool(active),
+        "complementary_slackness": float(lam * (np.sum(a * cont) - budget_bops)),
+        "kkt": kkt,
     }
 
 
-def check_kkt_stopping_criteria(
-    sp_history: List[float],
-    g_val: Dict[str, float],
+def linear_cost_coefficients(
+    layer_cost_fn: Callable[[str, int, int], Dict[str, float]],
+    layer: str,
+    w_options: Sequence[int],
+    a_in_bits: int,
+    resource: str = "LUT",
+) -> Tuple[float, float]:
+    """Least-squares line R(w) ~ p + q w of a layer's cost over the weight bit widths (for water-filling)."""
+    w = np.asarray(w_options, dtype=float)
+    r = np.array([layer_cost_fn(layer, int(b), a_in_bits)[resource] for b in w_options])
+    q, p = np.polyfit(w, r, 1)
+    return float(p), float(q)
+
+
+# ============================================================================ discrete problem
+
+
+@dataclass
+class ChoiceGroup:
+    """One compute layer together with the activation precision that feeds it."""
+
+    name: str
+    options: List[Dict[str, Dict[str, int]]]  # [{"w": {layer: b}, "a": {act_layer: b}}, ...]
+    omega: np.ndarray                         # (n_options,)
+    resources: Dict[str, np.ndarray]          # resource -> (n_options,)
+
+
+def build_choice_groups(
+    layer_order: Sequence[str],
+    activation_layers: Sequence[str],
+    omega_w: Dict[str, Dict[int, float]],
+    omega_a: Dict[str, Dict[int, float]],
+    layer_cost_fn: Callable[[str, int, int], Dict[str, float]],
+    w_options: Sequence[int],
+    a_options: Sequence[int],
+    input_bits: int,
+    fixed_a_bits: Optional[Dict[str, int]] = None,
+    resources: Sequence[str] = CONSTRAINED_RESOURCES,
+) -> List[ChoiceGroup]:
+    """Separable groups: group l = (w_l, a of the activation entering l). The network input is fixed."""
+    fixed_a_bits = fixed_a_bits or {}
+    groups, feeding = [], None
+    for name in layer_order:
+        if feeding is None:
+            a_opts = [None]
+        elif feeding in fixed_a_bits:
+            a_opts = [int(fixed_a_bits[feeding])]
+        else:
+            a_opts = list(a_options)
+        options, om, res = [], [], {r: [] for r in resources}
+        for w in w_options:
+            for a in a_opts:
+                a_in = input_bits if a is None else a
+                cost = layer_cost_fn(name, int(w), int(a_in))
+                options.append({"w": {name: int(w)}, "a": {} if a is None else {feeding: int(a)}})
+                om.append(omega_w[name][int(w)] + (0.0 if a is None else omega_a[feeding][int(a)]))
+                for r in resources:
+                    res[r].append(cost[r])
+        groups.append(ChoiceGroup(name, options, np.asarray(om), {r: np.asarray(v, float) for r, v in res.items()}))
+        feeding = name if name in activation_layers else None
+    return groups
+
+
+def assignment_from_indices(groups: Sequence[ChoiceGroup], idx: Sequence[int]) -> Tuple[Dict[str, int], Dict[str, int]]:
+    w_bits, a_bits = {}, {}
+    for g, i in zip(groups, idx):
+        w_bits.update(g.options[int(i)]["w"])
+        a_bits.update(g.options[int(i)]["a"])
+    return w_bits, a_bits
+
+
+def evaluate_indices(groups, idx, overhead: Dict[str, float]) -> Tuple[float, Dict[str, float]]:
+    omega = float(sum(g.omega[int(i)] for g, i in zip(groups, idx)))
+    res = {r: float(overhead.get(r, 0.0) + sum(g.resources[r][int(i)] for g, i in zip(groups, idx)))
+           for r in groups[0].resources}
+    return omega, res
+
+
+def normalized_constraints(resources: Dict[str, float], budgets: Dict[str, float]) -> Dict[str, float]:
+    """g_j = (R_j - B_j) / B_j (dimensionless; g_j = 0.2 means 20 % over budget)."""
+    return {r: (resources[r] - budgets[r]) / max(budgets[r], 1.0) for r in budgets}
+
+
+def solve_exact(groups: Sequence[ChoiceGroup], budgets: Dict[str, float], overhead: Dict[str, float]) -> Dict[str, Any]:
+    """Global optimum of the discrete problem by enumerating every combination of group options."""
+    n = len(groups)
+    shape = [len(g.omega) for g in groups]
+
+    def broadcast(vec, k):
+        s = [1] * n
+        s[k] = len(vec)
+        return vec.reshape(s)
+
+    total_omega = sum(broadcast(g.omega, k) for k, g in enumerate(groups))
+    feasible = np.ones(shape, dtype=bool)
+    for r, b in budgets.items():
+        tot = overhead.get(r, 0.0) + sum(broadcast(g.resources[r], k) for k, g in enumerate(groups))
+        feasible &= tot <= b * (1 + 1e-12)
+    n_feasible = int(feasible.sum())
+    if n_feasible == 0:
+        return {"feasible": False, "n_candidates": int(np.prod(shape)), "n_feasible": 0}
+    masked = np.where(feasible, total_omega, np.inf)
+    idx = np.unravel_index(int(np.argmin(masked)), shape)
+    omega, res = evaluate_indices(groups, idx, overhead)
+    w_bits, a_bits = assignment_from_indices(groups, idx)
+    return {
+        "feasible": True,
+        "indices": [int(i) for i in idx],
+        "w_bits": w_bits,
+        "a_bits": a_bits,
+        "omega": omega,
+        "resources": res,
+        "g": normalized_constraints(res, budgets),
+        "n_candidates": int(np.prod(shape)),
+        "n_feasible": n_feasible,
+    }
+
+
+def kkt_certificate(
+    omega_x: float,
+    dual_value: float,
     mu: Dict[str, float],
-    tol_sp: float = 1e-4,
-    tol_kkt: float = 1e-3,
-    window: int = 3,
-) -> Tuple[bool, Dict[str, Any]]:
-    """Checks KKT convergence criteria: SP stabilization, Primal Feasibility, and Complementary Slackness.
+    g: Dict[str, float],
+    tol_cs: float = 1e-9,
+) -> Dict[str, Any]:
+    """Lagrangian sufficient optimality conditions for x = argmin_x L(x, mu) (true by construction).
 
-    Conditions at optimal point (x*, mu*):
-    1. SP-Index Stabilization: |SP[-1] - mean(SP[-window-1:-1])| < tol_sp
-    2. Primal Feasibility: g_j(x*) <= 0 for all j in {'DSP', 'LUT', 'FF', 'BRAM_bits'}
-    3. Dual Feasibility: mu_j* >= 0 for all j
-    4. Complementary Slackness: |mu_j* * g_j(x*)| < tol_kkt for all j
+    If x is primal feasible, mu >= 0 and mu_j g_j(x) = 0 for all j, then Omega(x) = q(mu) <= Omega*,
+    so x is a global optimum -- for integer problems too (Everett's theorem). When no such pair exists
+    there is a duality gap and only bounds are available.
     """
-    sp_converged = False
-    sp_change = 1.0
-    if len(sp_history) > window:
-        sp_change = float(abs(sp_history[-1] - np.mean(sp_history[-(window + 1):-1])))
-        if sp_change < tol_sp:
-            sp_converged = True
-
-    primal_feasible = all(float(g) <= 1e-9 for g in g_val.values())
-    dual_feasible = all(float(m) >= -1e-12 for m in mu.values())
-    slackness_products = {k: float(abs(mu[k] * g_val[k])) for k in mu.keys()}
-    complementary_slackness = all(val < tol_kkt for val in slackness_products.values())
-
-    converged = bool(sp_converged and primal_feasible and dual_feasible and complementary_slackness)
-    diagnostics = {
-        "converged": converged,
-        "sp_converged": sp_converged,
-        "sp_change": sp_change,
-        "primal_feasible": primal_feasible,
-        "dual_feasible": dual_feasible,
-        "complementary_slackness": complementary_slackness,
-        "slackness_products": slackness_products,
+    cs = {r: float(mu[r] * g[r]) for r in g}
+    feasible = all(v <= 1e-12 for v in g.values())
+    dual_ok = all(v >= 0 for v in mu.values())
+    cs_ok = all(abs(v) <= tol_cs * max(abs(omega_x), 1e-30) for v in cs.values())
+    return {
+        "stationarity": True,
+        "primal_feasible": bool(feasible),
+        "dual_feasible": bool(dual_ok),
+        "complementary_slackness": cs,
+        "complementary_slackness_ok": bool(cs_ok),
+        "duality_gap": float(omega_x - dual_value),
+        "certified_optimal": bool(feasible and dual_ok and cs_ok),
     }
-    return converged, diagnostics
 
 
-class LagrangeKKTQuantizerOptimizer:
-    """Closed-Loop Primal-Dual optimizer with Lagrange Multipliers and KKT conditions on VU13P.
+class LagrangianDualAllocator:
+    """Dual decomposition with projected subgradient ascent on the shadow prices mu_j >= 0.
 
-    Implements the 3-step loop:
-    1. QUANTIZED NEURAL NETWORK (QKeras): Configures bitwidths and architecture (w_l, a_l, n_l).
-    2. PERFORMANCE & COST EVALUATION: Computes SP-Index loss (1 - SP) and VU13P resources.
-    3. LAGRANGE / KKT OPTIMIZATION CORE: Evaluates g_j(x) <= 0, updates shadow prices (mu_j),
-       and computes the next primal bitwidth allocation (w_l^{(t+1)}, a_l^{(t+1)}).
+    L(x, mu) = Omega(x) + sum_j mu_j g_j(x),  q(mu) = min_x L(x, mu)  (concave, q(mu) <= Omega*).
+    Primal step: x(mu) = argmin_x L(x, mu), exact and separable per group.
+    Dual step:   mu_j <- max(0, mu_j + eta_t g_j(x(mu))),  eta_t = theta_t (UB - q(mu_t)) / ||g||^2 (Polyak),
+                 theta_t halved when the dual bound stalls (Held-Karp).
+    Upper bound: best feasible point among the x(mu_t), each repaired/improved by a greedy Lagrangian
+                 heuristic (``repair_and_improve``). For an integer problem the dual bound need not reach
+                 the optimum (duality gap), so the result reports LB <= Omega* <= UB.
     """
 
-    def __init__(
-        self,
-        hardware_limits: Dict[str, float],
-        lr_x: float = 0.05,
-        lr_mu: float = 0.50,
-        normalize_constraints: bool = True,
-        slack_decay: float = 0.30,
-    ):
-        self.limits = {k: float(v) for k, v in hardware_limits.items()}
-        self.lr_x = lr_x
-        self.lr_mu = lr_mu
-        self.normalize_constraints = normalize_constraints
-        self.slack_decay = slack_decay
-
-        # Dual variables (shadow prices) mu_j >= 0
-        self.mu: Dict[str, float] = {k: 0.0 for k in self.limits.keys()}
+    def __init__(self, groups: Sequence[ChoiceGroup], budgets: Dict[str, float], overhead: Dict[str, float],
+                 use_heuristic: bool = True):
+        self.groups = list(groups)
+        self.budgets = {r: float(b) for r, b in budgets.items()}
+        self.overhead = {r: float(overhead.get(r, 0.0)) for r in self.budgets}
+        self.use_heuristic = use_heuristic  # repair/improve each x(mu) into a feasible upper bound
         self.history: List[Dict[str, Any]] = []
 
-    def evaluate_constraints(
-        self, resource_usage: Dict[str, float]
-    ) -> Tuple[Dict[str, float], Dict[str, float]]:
-        """Computes raw g_j(x) = R_j - B_j and normalized g_norm_j(x) = (R_j - B_j) / B_j."""
-        g_raw = {}
-        g_norm = {}
-        for k, limit_val in self.limits.items():
-            used = float(resource_usage.get(k, 0.0))
-            diff = used - limit_val
-            g_raw[k] = diff
-            denom = max(limit_val, 1.0)
-            g_norm[k] = diff / denom
-        return g_raw, g_norm
+    def _scale(self, r):
+        return max(self.budgets[r], 1.0)
 
-    def lagrangian_penalty(
-        self, sp_loss: float, resource_usage: Dict[str, float]
-    ) -> Tuple[float, Dict[str, float]]:
-        """Computes the penalized Lagrangian cost L(x, mu) = (1 - SP) + sum_j mu_j * max(0, g_j(x))."""
-        g_raw, g_norm = self.evaluate_constraints(resource_usage)
-        g_used = g_norm if self.normalize_constraints else g_raw
+    def lagrangian_argmin(self, mu: Dict[str, float]) -> Tuple[List[int], float]:
+        idx, q = [], 0.0
+        for g in self.groups:
+            val = g.omega + sum(mu[r] * g.resources[r] / self._scale(r) for r in self.budgets)
+            i = int(np.argmin(val))
+            idx.append(i)
+            q += float(val[i])
+        q += sum(mu[r] * (self.overhead[r] - self.budgets[r]) / self._scale(r) for r in self.budgets)
+        return idx, q
 
-        penalty = 0.0
-        for k in self.limits.keys():
-            penalty += self.mu[k] * max(0.0, g_used[k])
+    def repair_and_improve(self, idx: Sequence[int]) -> Optional[List[int]]:
+        """Lagrangian heuristic: make x(mu) feasible greedily, then improve it by feasible local moves.
 
-        total_cost = float(sp_loss + penalty)
-        return total_cost, g_used
-
-    def update_multipliers(self, g_val: Dict[str, float]) -> Dict[str, float]:
-        """Dual update via projected subgradient ascent + complementary slackness projection.
-
-        - If g_j(x) > 0 (resource limit violated): increases shadow price mu_j^{(t+1)} = mu_j^{(t)} + lr_mu * g_j.
-        - If g_j(x) <= 0 (resource feasible with slack): decays mu_j toward 0 so that
-          complementary slackness (mu_j* * g_j(x*) = 0) is strictly satisfied for inactive constraints.
+        Repair: while some g_j > 0, switch the group option with the smallest Omega increase per unit of
+        (normalized) violated resource released. Improve: repeatedly apply the single-group change with
+        the largest Omega decrease that keeps every constraint satisfied.
         """
-        for k in self.mu.keys():
-            gv = float(g_val[k])
-            if gv > 0.0:
-                self.mu[k] = float(self.mu[k] + self.lr_mu * gv)
+        idx = list(idx)
+        resources = list(self.budgets)
+        # per-group resource matrices (n_options, n_resources), and the totals of the current point
+        mats = [np.stack([g.resources[r] for r in resources], axis=1) for g in self.groups]
+        budget = np.array([self.budgets[r] for r in resources])
+        scale = np.array([self._scale(r) for r in resources])
+        base = np.array([self.overhead[r] for r in resources])
+
+        def totals(ix):
+            return base + sum(m[i] for m, i in zip(mats, ix))
+
+        def violation(tot):
+            return np.maximum((tot - budget) / scale, 0.0).sum(axis=-1)
+
+        tot = totals(idx)
+        while violation(tot) > 1e-12:
+            best, v_now = None, violation(tot)
+            for k, (grp, m) in enumerate(zip(self.groups, mats)):
+                cand_tot = tot - m[idx[k]] + m              # totals if group k switches to each option
+                dv = v_now - violation(cand_tot)            # strict decrease of the total violation
+                for i in np.nonzero(dv > 1e-15)[0]:
+                    ratio = (grp.omega[i] - grp.omega[idx[k]]) / dv[i]
+                    if best is None or ratio < best[0]:
+                        best = (ratio, k, int(i))
+            if best is None:
+                return None
+            idx[best[1]] = best[2]
+            tot = totals(idx)
+        while True:
+            best = None
+            for k, (grp, m) in enumerate(zip(self.groups, mats)):
+                cand_tot = tot - m[idx[k]] + m
+                ok = np.all(cand_tot <= budget * (1 + 1e-12), axis=1) & (grp.omega < grp.omega[idx[k]])
+                if ok.any():
+                    i = int(np.argmin(np.where(ok, grp.omega, np.inf)))
+                    gain = grp.omega[idx[k]] - grp.omega[i]
+                    if best is None or gain > best[0]:
+                        best = (gain, k, i)
+            if best is None:
+                return idx
+            idx[best[1]] = best[2]
+            tot = totals(idx)
+        while True:
+            omega_now, _ = evaluate_indices(self.groups, idx, self.overhead)
+            best = None
+            for k, grp in enumerate(self.groups):
+                for i in np.argsort(grp.omega):
+                    if grp.omega[i] >= grp.omega[idx[k]]:
+                        break
+                    cand = list(idx)
+                    cand[k] = int(i)
+                    if self._feasible(cand):
+                        gain = grp.omega[idx[k]] - grp.omega[i]
+                        if best is None or gain > best[0]:
+                            best = (gain, cand)
+                        break  # options are visited by increasing Omega: first feasible is the best for k
+            if best is None:
+                return idx
+            idx = best[1]
+
+    def _cheapest_feasible(self):
+        idx = [int(np.argmin(sum(g.resources[r] / self._scale(r) for r in self.budgets))) for g in self.groups]
+        omega, res = evaluate_indices(self.groups, idx, self.overhead)
+        g = normalized_constraints(res, self.budgets)
+        return (idx, omega) if all(v <= 1e-12 for v in g.values()) else (None, np.inf)
+
+    def solve(self, max_iter: int = 500, tol_gap: float = 1e-4, theta0: float = 1.0, patience: int = 10,
+              theta_min: float = 1e-4, mu0: Optional[Dict[str, float]] = None) -> Dict[str, Any]:
+        mu = {r: float((mu0 or {}).get(r, 0.0)) for r in self.budgets}
+        best_idx, ub = self._cheapest_feasible()
+        if best_idx is None:
+            raise ValueError("No feasible configuration: even the cheapest bit widths violate a budget.")
+        lb, theta, stall = -np.inf, theta0, 0
+        self.history = []
+        stop = "max_iter"
+        cert = None
+        for t in range(1, max_iter + 1):
+            idx, q = self.lagrangian_argmin(mu)
+            omega_x, res = evaluate_indices(self.groups, idx, self.overhead)
+            g = normalized_constraints(res, self.budgets)
+            feasible = all(v <= 1e-12 for v in g.values())
+            if feasible and omega_x < ub:
+                ub, best_idx = omega_x, idx
+            if self.use_heuristic:
+                cand = self.repair_and_improve(idx)
+                if cand is not None:
+                    omega_c, _ = evaluate_indices(self.groups, cand, self.overhead)
+                    if omega_c < ub:
+                        ub, best_idx = omega_c, cand
+            if not np.isfinite(lb) or q > lb + 1e-12 * max(abs(lb), 1e-30):
+                lb, stall = q, 0
             else:
-                updated = self.mu[k] + self.lr_mu * gv
-                self.mu[k] = float(max(0.0, min(updated, self.mu[k] * self.slack_decay)))
-        return self.mu.copy()
+                stall += 1
+                if stall >= patience:
+                    theta, stall = theta / 2.0, 0
+            cert = kkt_certificate(omega_x, q, mu, g)
+            w_bits, a_bits = assignment_from_indices(self.groups, idx)
+            self.history.append({
+                "iteration": t, "mu": dict(mu), "g": g, "resources": res, "dual_value": q, "omega_x": omega_x,
+                "upper_bound": ub, "lower_bound": lb, "theta": theta, "feasible": feasible,
+                "w_bits": w_bits, "a_bits": a_bits,
+            })
+            if cert["certified_optimal"]:
+                stop = "kkt_certificate"
+                break
+            if ub - lb <= tol_gap * abs(ub):
+                stop = "duality_gap"
+                break
+            if theta < theta_min:
+                stop = "dual_stalled"  # remaining gap is (mostly) the integer duality gap
+                break
+            norm2 = sum(v * v for v in g.values())
+            if norm2 == 0.0:
+                stop = "zero_subgradient"
+                break
+            eta = theta * (ub - q) / norm2
+            mu = {r: max(0.0, mu[r] + eta * g[r]) for r in mu}
 
-    def compute_primal_bit_update(
-        self,
-        layer_names: List[str],
-        c_coeffs: List[float],
-        macs_list: List[float],
-        params_list: List[float],
-        current_w: Dict[str, int],
-        current_a: Dict[str, int],
-        b_min: int = 2,
-        b_max: int = 8,
-    ) -> Tuple[Dict[str, int], Dict[str, int], Dict[str, Any]]:
-        """Computes the next primal configuration (w_l^{(t+1)}, a_l^{(t+1)}) from current shadow prices mu_j.
+        omega_b, res_b = evaluate_indices(self.groups, best_idx, self.overhead)
+        w_bits, a_bits = assignment_from_indices(self.groups, best_idx)
+        return {
+            "w_bits": w_bits,
+            "a_bits": a_bits,
+            "omega": omega_b,
+            "resources": res_b,
+            "g": normalized_constraints(res_b, self.budgets),
+            "mu": dict(mu),
+            "lower_bound": float(lb),
+            "upper_bound": float(ub),
+            "relative_gap": float((ub - lb) / abs(ub)) if ub else 0.0,
+            "iterations": len(self.history),
+            "stop_reason": stop,
+            "last_certificate": cert,
+        }
 
-        Follows KKT stationarity on the VU13P:
-        1. If mu_DSP > 0 or B_DSP == 0: enforces sub-byte arithmetic (w_l <= 8, a_l <= 8) so DSP = 0.
-        2. If mu_LUT > 0 or mu_BRAM > 0: computes the effective BOPs/LUT budget from B_LUT and B_BRAM
-           and solves the analytical KKT water-filling problem weighted by layer sensitivities c_l.
-        3. Adapts activation bitwidths a_l on high-MAC layers when LUT pressure remains active.
-        """
-        # 1. Enforce DSP constraint (UltraScale+ uses DSP48E2 when w_l > 8 or a_l > 8)
-        eff_b_max = b_max if (self.mu.get("DSP", 0.0) > 0.0 or self.limits.get("DSP", 0.0) <= 0.0) else 16
 
-        # 2. Check if all constraints are already feasible and only DSP was violated at 16-bit
-        lut_pressure = self.mu.get("LUT", 0.0)
-        bram_pressure = self.mu.get("BRAM_bits", 0.0)
-        ff_pressure = self.mu.get("FF", 0.0)
-
-        # If no LUT/BRAM multiplier is active yet (e.g., right after 16-bit DSP violation),
-        # step down to uniform 8-bit first so the dual loop can measure pure LUT/BRAM pressure.
-        if lut_pressure <= 1e-9 and any(v > 8 for v in current_w.values()):
-            next_w = {name: eff_b_max for name in layer_names}
-            next_a = {name: eff_b_max for name in current_a.keys()}
-            return next_w, next_a, {"regime": "sub_byte_8bit_projection"}
-
-        # 3. When LUT or BRAM shadow prices are active, solve KKT water-filling under VU13P LUT/BRAM ceiling
-        a_bits_vec = np.array([float(current_a.get(name, 8)) for name in layer_names], dtype=np.float64)
-        macs_vec = np.array(macs_list, dtype=np.float64)
-        a_costs = (macs_vec * a_bits_vec).tolist()
-
-        # Target BOPs derived from VU13P LUT budget (since LUT = BOPs / 18 in sub-byte mode)
-        lut_limit = self.limits.get("LUT", 2500.0)
-        bops_from_lut_limit = lut_limit * 18.0
-
-        # Tighten effective budget proportionally to accumulated shadow price mu_LUT + mu_BRAM
-        pressure_factor = min(1.0, max(0.58, 1.0 / (1.0 + 0.35 * (lut_pressure + bram_pressure + ff_pressure))))
-        bops_8bit = float(np.sum(macs_vec * 8.0 * 8.0))
-        target_bops = min(bops_from_lut_limit, bops_8bit * pressure_factor)
-
-        kkt_sol = solve_kkt_bit_allocation(
-            layer_names=layer_names,
-            c_coeffs=c_coeffs,
-            a_costs=a_costs,
-            budget_bops=target_bops,
-            b_min=b_min,
-            b_max=eff_b_max,
-        )
-        next_w = kkt_sol["integer_bits"]
-
-        # Check resulting LUT usage with current_a; if LUT > lut_limit, quantize dense activation to 6 bits
-        est_bops_with_cur_a = sum(
-            macs_list[i] * next_w[name] * current_a.get(name, 8)
-            for i, name in enumerate(layer_names)
-        )
-        est_luts = est_bops_with_cur_a / 18.0
-        next_a = dict(current_a)
-        for k in next_a:
-            next_a[k] = min(next_a[k], eff_b_max)
-
-        if est_luts > lut_limit and "dense_1" in next_a:
-            next_a["dense_1"] = 6
-
-        return next_w, next_a, kkt_sol
-
-    def record_step(
-        self,
-        iteration: int,
-        sp_val: float,
-        w_bits: Dict[str, int],
-        a_bits: Dict[str, int],
-        resource_usage: Dict[str, float],
-        g_val: Dict[str, float],
-        lagrangian_cost: float,
-        kkt_diag: Dict[str, Any],
-    ) -> None:
-        """Records full primal-dual telemetry for plotting and article tables."""
-        g_raw, _ = self.evaluate_constraints(resource_usage)
-        self.history.append({
-            "iteration": iteration,
-            "sp_val": float(sp_val),
-            "sp_loss": float(1.0 - sp_val),
-            "lagrangian_cost": float(lagrangian_cost),
-            "w_bits": dict(w_bits),
-            "a_bits": dict(a_bits),
-            "resources": {k: float(v) for k, v in resource_usage.items()},
-            "g_raw": {k: float(v) for k, v in g_raw.items()},
-            "g_val": {k: float(v) for k, v in g_val.items()},
-            "mu": {k: float(v) for k, v in self.mu.items()},
-            "kkt_diagnostics": kkt_diag,
-        })
+def budget_frontier(
+    groups: Sequence[ChoiceGroup],
+    budgets: Dict[str, float],
+    overhead: Dict[str, float],
+    resource: str,
+    values: Sequence[float],
+) -> List[Dict[str, Any]]:
+    """Exact optimum as a function of one budget (others fixed): the Omega*-vs-B_j Pareto front."""
+    out = []
+    for v in values:
+        b = dict(budgets)
+        b[resource] = float(v)
+        sol = solve_exact(groups, b, overhead)
+        sol["budget_value"] = float(v)
+        out.append(sol)
+    return out

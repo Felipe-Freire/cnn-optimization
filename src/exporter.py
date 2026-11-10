@@ -13,6 +13,15 @@ import tensorflow as tf
 import tf_keras as keras
 
 
+def _json_default(obj: Any) -> Any:
+    """JSON fallback for numpy scalars/arrays inside metadata dictionaries."""
+    if isinstance(obj, np.generic):
+        return obj.item()
+    if isinstance(obj, np.ndarray):
+        return obj.tolist()
+    raise TypeError(f"Object of type {type(obj).__name__} is not JSON serializable")
+
+
 class ArtifactExporter:
     """Manages hierarchical output organization for ATLAS L0 Ringer experiments.
 
@@ -76,14 +85,22 @@ class ArtifactExporter:
         filename = f"model_v{self.version}_f{fold}_r{repeat}.keras"
         path = os.path.join(self.saved_models_dir, filename)
         model.save(path)
+        model.save(path[: -len(".keras")] + ".h5")  # reloadable copy, see save_best_model
         return path
 
     def save_best_model(
         self, model: keras.Model, input_dim: Optional[int] = None
     ) -> Dict[str, str]:
-        """Saves best_model.keras and exports best_model.onnx in saved_models/."""
+        """Saves best_model.keras (+ best_model.h5) and exports best_model.onnx in saved_models/.
+
+        QKeras models saved in the ``.keras`` format cannot be reloaded with ``load_model``/``load_qmodel``
+        (QActivation fails in ``from_config``); only their weights can be read back. The legacy HDF5 copy
+        reloads with ``qkeras.utils.load_qmodel(path)`` and is what downstream tools (hls4ml) should use.
+        """
         keras_path = os.path.join(self.saved_models_dir, "best_model.keras")
         model.save(keras_path)
+        h5_path = os.path.join(self.saved_models_dir, "best_model.h5")
+        model.save(h5_path)
 
         onnx_path = os.path.join(self.saved_models_dir, "best_model.onnx")
         try:
@@ -107,7 +124,7 @@ class ArtifactExporter:
             with open(onnx_path, "w", encoding="utf-8") as f:
                 json.dump(onnx_meta, f, indent=2)
 
-        return {"keras_path": keras_path, "onnx_path": onnx_path}
+        return {"keras_path": keras_path, "h5_path": h5_path, "onnx_path": onnx_path}
 
     def save_history(self, history_dict: Dict[str, List[float]]) -> Dict[str, str]:
         """Saves best-run epoch history in CSV and JSON formats under history/."""
@@ -188,7 +205,7 @@ class ArtifactExporter:
         }
         repro_path = os.path.join(self.metadata_dir, "reproducibility_metadata.json")
         with open(repro_path, "w", encoding="utf-8") as f:
-            json.dump(repro_meta, f, indent=2)
+            json.dump(repro_meta, f, indent=2, default=_json_default)
 
         paths = {
             "pkl_path": pkl_path,
@@ -200,7 +217,7 @@ class ArtifactExporter:
         if kkt_result is not None:
             kkt_path = os.path.join(self.metadata_dir, "kkt_allocation_results.json")
             with open(kkt_path, "w", encoding="utf-8") as f:
-                json.dump(kkt_result, f, indent=2)
+                json.dump(kkt_result, f, indent=2, default=_json_default)
             paths["kkt_path"] = kkt_path
 
         return paths

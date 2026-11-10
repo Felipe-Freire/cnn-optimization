@@ -126,6 +126,20 @@ def compute_sp_with_threshold(
     )
 
 
+def sp_at_threshold(y_true: np.ndarray, y_pred: np.ndarray, threshold: float) -> Tuple[float, float, float]:
+    """SP, PD and FA at a decision threshold fixed beforehand (no re-optimization on the evaluated set).
+
+    Use it on the holdout with the threshold chosen on validation: maximizing SP over thresholds on the
+    test set itself (``compute_sp_with_threshold``) is optimistically biased.
+    """
+    sel = np.asarray(y_pred) >= threshold
+    y_true = np.asarray(y_true)
+    pd_ = float(np.mean(sel[y_true == 1]))
+    fa = float(np.mean(sel[y_true == 0]))
+    sp = float(np.sqrt(np.sqrt(pd_ * (1.0 - fa)) * 0.5 * (pd_ + (1.0 - fa))))
+    return sp, pd_, fa
+
+
 class SPCallback(Callback):
     """Keras Callback for monitoring SP index and saving best model weights."""
 
