@@ -9,8 +9,13 @@ import pytest
 import tf_keras as keras
 
 from src.exporter import ArtifactExporter
+from src.hardware import (
+    compute_model_hardware_costs,
+    estimate_vu13p_detailed_resources,
+    extract_qtools_hardware_profile,
+)
 from src.metrics import CONFIG_VERSOES, ESTRUTURA_BASE, compute_sp_with_threshold, slice_rings_by_version
-from src.models import build_compact_cnn1d_fp32
+from src.models import build_compact_cnn1d_fp32, build_compact_qcnn1d
 from src.visualization import (
     plot_best_model_roc,
     plot_confusion_matrix_knee,
@@ -227,3 +232,36 @@ def test_all_visualizations(tmp_path):
     budget = {"DSP": 0.0, "LUT": 2500.0, "FF": 10000.0, "BRAM_bits": 5500.0}
     p10 = plot_vu13p_resource_utilization(hw_8b, hw_kkt, budget, save_path=str(tmp_path / "vu13p_res.png"))
     assert os.path.isfile(p10) and os.path.getsize(p10) > 0
+
+
+def test_qtools_vu13p_detailed_estimator():
+    """Verify qkeras.qtools integration extracts accumulator bitwidths, energy (pJ), and VU13P latency."""
+    w_bits = {"conv1d_1": 2, "dense_1": 5, "output_dense": 8}
+    a_bits = {"conv1d_1": 8, "dense_1": 8}
+    qmodel = build_compact_qcnn1d(
+        input_dim=25, num_filters=8, kernel_size=3, dense_units=8,
+        weights_bits=w_bits, act_bits=a_bits
+    )
+
+    q_prof = extract_qtools_hardware_profile(qmodel, input_bits=8)
+    assert q_prof["total_energy_pj"] > 0
+    assert "conv1d_1" in q_prof["layers"]
+    assert q_prof["layers"]["conv1d_1"]["acc_bits"] == 12
+    assert q_prof["layers"]["dense_1"]["acc_bits"] == 20
+    assert q_prof["layers"]["output_dense"]["acc_bits"] == 20
+
+    det = estimate_vu13p_detailed_resources(
+        qmodel, weights_bits=w_bits, act_bits=a_bits, reuse_factor=1, clock_mhz=250.0, input_dim=25
+    )
+    assert det["total_latency_cycles"] > 0
+    assert det["total_latency_ns"] > 0
+    assert len(det["layers"]) == 3
+
+    hw = compute_model_hardware_costs(qmodel, weights_bits=w_bits, act_bits=a_bits, input_dim=25)
+    assert hw["vu13p_resources"]["DSP"] == 0.0
+    assert abs(hw["vu13p_resources"]["LUT"] - 2268.444) < 0.1
+    assert hw["vu13p_resources"]["BRAM_bits"] == 4016.0
+    assert hw["total_energy_pj"] == q_prof["total_energy_pj"]
+    assert hw["breakdown"][0]["acc_bits"] == 12
+    assert hw["breakdown"][1]["acc_bits"] == 20
+
