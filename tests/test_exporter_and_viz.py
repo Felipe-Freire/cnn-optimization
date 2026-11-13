@@ -8,7 +8,7 @@ import pandas as pd
 import pytest
 import tf_keras as keras
 
-from src.exporter import ArtifactExporter
+from src.exporter import ArtifactExporter, export_csvs_for_existing_regions
 from src.hardware import (
     compute_model_hardware_costs,
     estimate_vu13p_detailed_resources,
@@ -117,26 +117,45 @@ def test_artifact_exporter_hierarchy(tmp_path):
         {"fold": 1, "sp_max": 0.95, "pd_knee": 0.96, "fa_knee": 0.04, "auc": 0.99},
         {"fold": 2, "sp_max": 0.94, "pd_knee": 0.95, "fa_knee": 0.05, "auc": 0.98},
     ])
-    meta_paths = exporter.save_metadata(
-        training_results=[{"fold": 1, "max_sp": 0.95, "keras_history": hist}],
-        cv_df=cv_df,
-        kkt_result={"bit_allocation": {"conv1d_1": 4, "dense_1": 6}},
-        extra_config={"rings": 25},
-    )
-    for p in meta_paths.values():
-        assert os.path.isfile(p)
-
-    with open(meta_paths["repro_path"], "r", encoding="utf-8") as f:
-        repro = json.load(f)
-    assert repro["version"] == 2
-    assert repro["iet"] == 5
-
     x_test = np.zeros((10, 25), dtype=np.float32)
     y_test = np.array([0, 1] * 5, dtype=np.int32)
     y_pred = np.linspace(0.1, 0.9, 10, dtype=np.float32)
     eval_paths = exporter.save_evaluation_splits(x_test, y_test, y_pred, threshold=0.48)
     assert os.path.isfile(eval_paths["test_set_path"])
     assert os.path.isfile(eval_paths["predictions_path"])
+
+    hw_kkt = compute_model_hardware_costs(
+        model, weights_bits={"conv1d_1": 2, "dense_1": 5, "output_dense": 8}, act_bits=8, input_dim=25
+    )
+    meta_paths = exporter.save_metadata(
+        training_results=[{"fold": 1, "max_sp": 0.95, "keras_history": hist}],
+        cv_df=cv_df,
+        kkt_result={
+            "integer_bits": {"conv1d_1": 2, "dense_1": 5, "output_dense": 8},
+            "activation_bits": {"conv1d_1": 8, "dense_1": 8},
+            "continuous_bits": {"conv1d_1": 2.7, "dense_1": 5.1, "output_dense": 2.0},
+            "primal_dual_history": [{"iteration": 0, "sp_val": 0.97, "sp_loss": 0.03, "lagrangian_cost": 0.03}],
+        },
+        extra_config={"rings": 25, "hardware_qkeras_kkt": hw_kkt},
+        folds_y_true=[y_test, y_test],
+        folds_y_pred=[y_pred, y_pred],
+    )
+    for p in meta_paths.values():
+        assert os.path.isfile(p)
+
+    assert "layer_breakdown_csv" in meta_paths
+    assert "hardware_summary_csv" in meta_paths
+    assert "kkt_history_csv" in meta_paths
+    assert "fa_workpoints_csv" in meta_paths
+    assert "region_evaluation_summary_csv" in meta_paths
+
+    exported_map = export_csvs_for_existing_regions(str(tmp_path))
+    assert len(exported_map) == 1
+
+    with open(meta_paths["repro_path"], "r", encoding="utf-8") as f:
+        repro = json.load(f)
+    assert repro["version"] == 2
+    assert repro["iet"] == 5
 
 
 def test_all_visualizations(tmp_path):
