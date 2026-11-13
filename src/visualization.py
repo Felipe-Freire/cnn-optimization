@@ -663,3 +663,8 @@ def plot_primal_dual_kkt_evolution(
     else:
         plt.close(fig)
     return save_path
+
+
+# Alias de retrocompatibilidade para células legadas
+plot_pareto_and_roc_duel = plot_roc_duel_fp32_vs_kkt
+
