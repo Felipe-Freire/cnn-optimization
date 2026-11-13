@@ -7,7 +7,7 @@ iet,ieta,version,metric,vu13p_chip_limit,instance_budget_Bj,fp32_usage,kkt_optim
 5,0,v2,total_macs,,,1376.0,1376.0,,,,,True
 5,0,v2,total_params,,,817.0,817.0,,,,,True
 5,0,v2,total_weight_bits,,,6536.0,4016.0,,,,,True
-5,0,v2,total_energy_core_pj,,,409.0,240.0,,,,,True
-5,0,v2,total_energy_with_io_pj,,,445.0,271.0,,,,,True
+5,0,v2,total_energy_core_pj,,,347.0,240.0,,,,,True
+5,0,v2,total_energy_with_io_pj,,,364.0,271.0,,,,,True
 5,0,v2,total_latency_cycles,,,18.0,18.0,,,,,True
 5,0,v2,total_latency_ns,,,72.0,72.0,,,,,True

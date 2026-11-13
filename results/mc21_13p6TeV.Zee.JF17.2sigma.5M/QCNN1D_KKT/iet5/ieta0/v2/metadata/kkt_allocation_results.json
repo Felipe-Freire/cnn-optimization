@@ -1,8 +1,8 @@
 {
-  "lambda_optimal": 0.00022098139564875115,
+  "lambda_optimal": 0.00011205021324113871,
   "continuous_bits": {
-    "conv1d_1": 2.7344596436822783,
-    "dense_1": 5.167088820852169,
+    "conv1d_1": 2.313146354083201,
+    "dense_1": 5.496239825973439,
     "output_dense": 2.0
   },
   "integer_bits": {
@@ -26,9 +26,9 @@
   "primal_dual_history": [
     {
       "iteration": 1,
-      "sp_val": 0.9784237807013507,
-      "sp_loss": 0.02157621929864928,
-      "lagrangian_cost": 0.02157621929864928,
+      "sp_val": 0.9779375469432507,
+      "sp_loss": 0.022062453056749254,
+      "lagrangian_cost": 0.022062453056749254,
       "w_bits": {
         "conv1d_1": 16,
         "dense_1": 16,
@@ -79,9 +79,9 @@
     },
     {
       "iteration": 2,
-      "sp_val": 0.9783206209958808,
-      "sp_loss": 0.021679379004119204,
-      "lagrangian_cost": 0.22913966330163987,
+      "sp_val": 0.9780965631011854,
+      "sp_loss": 0.021903436898814577,
+      "lagrangian_cost": 0.22936372119633525,
       "w_bits": {
         "conv1d_1": 8,
         "dense_1": 8,
@@ -132,9 +132,9 @@
     },
     {
       "iteration": 3,
-      "sp_val": 0.9771960639048661,
-      "sp_loss": 0.02280393609513387,
-      "lagrangian_cost": 0.02280393609513387,
+      "sp_val": 0.9769465862150751,
+      "sp_loss": 0.02305341378492487,
+      "lagrangian_cost": 0.02305341378492487,
       "w_bits": {
         "conv1d_1": 2,
         "dense_1": 5,
@@ -171,7 +171,7 @@
       "kkt_diagnostics": {
         "converged": false,
         "sp_converged": false,
-        "sp_change": 0.0011761369437496283,
+        "sp_change": 0.0010704688071428992,
         "primal_feasible": true,
         "dual_feasible": true,
         "complementary_slackness": false,
@@ -185,9 +185,9 @@
     },
     {
       "iteration": 4,
-      "sp_val": 0.9771960639048661,
-      "sp_loss": 0.02280393609513387,
-      "lagrangian_cost": 0.02280393609513387,
+      "sp_val": 0.9769465862150751,
+      "sp_loss": 0.02305341378492487,
+      "lagrangian_cost": 0.02305341378492487,
       "w_bits": {
         "conv1d_1": 2,
         "dense_1": 5,
@@ -224,7 +224,7 @@
       "kkt_diagnostics": {
         "converged": false,
         "sp_converged": true,
-        "sp_change": 0.0005622785455073886,
+        "sp_change": 0.0005749884430551466,
         "primal_feasible": true,
         "dual_feasible": true,
         "complementary_slackness": false,
@@ -238,9 +238,9 @@
     },
     {
       "iteration": 5,
-      "sp_val": 0.9771960639048661,
-      "sp_loss": 0.02280393609513387,
-      "lagrangian_cost": 0.02280393609513387,
+      "sp_val": 0.9769465862150751,
+      "sp_loss": 0.02305341378492487,
+      "lagrangian_cost": 0.02305341378492487,
       "w_bits": {
         "conv1d_1": 2,
         "dense_1": 5,
