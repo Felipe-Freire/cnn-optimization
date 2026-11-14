@@ -1,4 +1,4 @@
 iet,ieta,version,layer_name,layer_type,units,params,macs,kkt_continuous_bits,w_bits,a_bits,mult_bits,acc_bits,acc_int_bits,ap_fixed_weight,ap_fixed_acc,bops,vu13p_DSP,vu13p_LUT,vu13p_LUT_adder_tree_rf1,vu13p_FF,vu13p_FF_line_buffer,vu13p_BRAM_bits,energy_pj,latency_cycles,latency_ns
-5,0,v2,conv1d_1,QConv1D,8,32,600,2.3131,2,8,10,12,4,"ap_fixed<2, 2>","ap_fixed<12, 4>",9600,0.0,533.33,2520.0,364.0,192.0,64.0,65.3,4,16.0
-5,0,v2,dense_1,QDense,8,776,768,5.4962,5,8,13,20,12,"ap_fixed<5, 3>","ap_fixed<20, 12>",30720,0.0,1706.67,5376.0,4264.0,0.0,3880.0,162.75,9,36.0
-5,0,v2,output_dense,QDense,1,9,8,2.0,8,8,16,20,9,"ap_fixed<8, 3>","ap_fixed<20, 9>",512,0.0,28.44,56.0,76.0,0.0,72.0,3.94,5,20.0
+5,0,v2,conv1d_1,QConv1D,8,32,600,3.2688,3,8,11,13,5,"ap_fixed<3, 3>","ap_fixed<13, 5>",14400,0.0,800.0,2730.0,396.0,192.0,96.0,83.03,4,16.0
+5,0,v2,dense_1,QDense,8,776,768,6.0043,6,8,14,21,12,"ap_fixed<6, 3>","ap_fixed<21, 12>",36864,0.0,2048.0,5644.8,5040.0,0.0,4656.0,185.53,9,36.0
+5,0,v2,output_dense,QDense,1,9,8,4.0261,8,8,16,20,9,"ap_fixed<8, 3>","ap_fixed<20, 9>",512,0.0,28.44,56.0,76.0,0.0,72.0,3.94,5,20.0
