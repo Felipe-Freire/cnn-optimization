@@ -1,8 +1,13 @@
 """Mixed-precision bit allocation via Hessian sensitivity and Karush-Kuhn-Tucker (KKT) on VU13P."""
 
+import warnings
 from typing import Any, Callable, Dict, List, Optional, Tuple
 import numpy as np
 import tensorflow as tf
+
+from src.models import QUANTIZER_INTEGER_BITS
+
+MIN_TRACE = 1e-8
 
 
 def compute_hutchinson_hessian_trace(
@@ -13,75 +18,88 @@ def compute_hutchinson_hessian_trace(
     num_hvp: int = 10,
     seed: int = 42,
 ) -> Dict[str, float]:
-    """Estimate the trace of the Hessian for each layer's weights using Hutchinson's algorithm.
+    """Estimate the full trace of each layer's Hessian block with Hutchinson's algorithm.
 
-    Tr(H_i) ~ (1 / M) * sum_j [ z_j^T * H_i * z_j ]
-    where z_j is a random Rademacher vector (elements in {-1, +1}).
+    Tr(H_ll) ~ (1 / M) * sum_j [ z_j^T H_ll z_j ],  z_j Rademacher (entries in {-1, +1}).
+
+    Each layer is probed separately (one Hessian-vector product per layer and draw). Probing all
+    layers with one joint vector adds the cross-layer terms z_l^T H_lm z_m, which average to zero
+    but inflate the variance, and the estimate of a small layer can come out negative.
 
     Args:
         model: Trained tf.keras.Model.
         loss_fn: Loss function (e.g. BinaryCrossentropy).
         x_batch: Sample batch of input features.
         y_batch: Corresponding ground-truth labels.
-        num_hvp: Number of Hessian-Vector Products (Monte Carlo evaluations).
-        seed: Random seed for Rademacher vectors.
+        num_hvp: Number of Rademacher draws per layer.
+        seed: Seed of the local random generator (the global NumPy state is not touched).
 
     Returns:
-        Dictionary mapping layer name to its estimated Hessian trace Tr(H_i).
+        Dictionary mapping layer name to the estimated trace (sum over the layer's kernel entries).
+        A non-positive estimate is replaced by MIN_TRACE with a warning, since the sensitivity
+        model needs c_l > 0.
     """
-    np.random.seed(seed)
+    rng = np.random.default_rng(seed)
     target_layers = [l for l in model.layers if hasattr(l, "kernel") and l.kernel is not None]
-    trainable_vars = [l.kernel for l in target_layers]
-    layer_names = [l.name for l in target_layers]
-    var_traces = {name: 0.0 for name in layer_names}
+    traces: Dict[str, float] = {}
 
-    for _ in range(num_hvp):
-        v_list = []
-        for var in trainable_vars:
-            rademacher = np.random.choice([-1.0, 1.0], size=var.shape).astype(np.float32)
-            v_list.append(tf.convert_to_tensor(rademacher))
+    for layer in target_layers:
+        var = layer.kernel
+        total = 0.0
+        for _ in range(num_hvp):
+            z = tf.constant(rng.choice([-1.0, 1.0], size=var.shape).astype(np.float32))
+            with tf.GradientTape() as outer_tape:
+                with tf.GradientTape() as inner_tape:
+                    loss = loss_fn(y_batch, model(x_batch, training=False))
+                grad = inner_tape.gradient(loss, var)
+                grad_dot_z = tf.reduce_sum(grad * z)
+            hvp = outer_tape.gradient(grad_dot_z, var)
+            total += float(tf.reduce_sum(z * hvp).numpy())
+        traces[layer.name] = total / num_hvp
 
-        with tf.GradientTape() as outer_tape:
-            with tf.GradientTape() as inner_tape:
-                y_pred = model(x_batch, training=False)
-                loss = loss_fn(y_batch, y_pred)
-
-            grads = inner_tape.gradient(loss, trainable_vars)
-            gv_products = [tf.reduce_sum(g * v) for g, v in zip(grads, v_list) if g is not None]
-            total_gv = tf.add_n(gv_products)
-
-        hvps = outer_tape.gradient(total_gv, trainable_vars)
-
-        for name, v, hvp in zip(layer_names, v_list, hvps):
-            if hvp is not None:
-                quad_form = tf.reduce_sum(v * hvp).numpy()
-                var_traces[name] += float(quad_form) / num_hvp
-
-    return {k: max(1e-8, v) for k, v in var_traces.items()}
+    for name, value in traces.items():
+        if value <= MIN_TRACE:
+            warnings.warn(
+                f"Hutchinson trace of '{name}' is {value:.3g}; replaced by {MIN_TRACE}. "
+                "Increase num_hvp or the batch size.",
+                RuntimeWarning,
+            )
+    return {name: max(MIN_TRACE, value) for name, value in traces.items()}
 
 
 def compute_layer_c_coefficients(
     model: tf.keras.Model,
     traces: Dict[str, float],
+    integer_bits: int = QUANTIZER_INTEGER_BITS,
 ) -> Dict[str, float]:
-    """Compute perturbation sensitivity coefficients: c_i = Tr(H_i) * (n_i * r_i^2) / 3.
+    """Sensitivity c_l of the quantization model Omega_l(b) = c_l * 4^(-b).
+
+    Around the trained point (gradient ~ 0), quantizing the kernel W_l with b bits gives
+
+        Delta L ~ 1/2 * (Tr(H_ll) / n_l) * ||Q_b(W_l) - W_l||^2,
+
+    i.e. the mean curvature of the layer times the total squared error. With uniform rounding of
+    step Delta = kappa * 2^(-b), ||Q_b(W_l) - W_l||^2 ~ n_l * Delta^2 / 12, so n_l cancels against
+    the full trace returned by compute_hutchinson_hessian_trace:
+
+        c_l = Tr(H_ll) * kappa^2 / 24,    kappa = 2^(integer_bits + 1).
+
+    kappa is the width of the range [-2^I, 2^I) of quantized_bits(b, I, alpha=1), the quantizer
+    the model is trained with (src.models), which does not adapt to max|W_l|.
 
     Args:
         model: Trained model.
-        traces: Estimated Hessian trace per layer.
+        traces: Full Hessian trace per layer (sum over the kernel entries).
+        integer_bits: Integer bits I of the weight quantizer.
 
     Returns:
-        Dictionary mapping layer name to c_i coefficient.
+        Dictionary mapping layer name to c_l.
     """
+    kappa = 2.0 ** (integer_bits + 1)
     c_coeffs = {}
     for layer in model.layers:
         if layer.name in traces and hasattr(layer, "kernel") and layer.kernel is not None:
-            weights = layer.kernel.numpy()
-            n_i = weights.size
-            r_i = float(np.max(np.abs(weights))) + 1e-6
-            tr_h = traces[layer.name]
-            c_i = tr_h * (n_i * (r_i ** 2)) / 3.0
-            c_coeffs[layer.name] = float(c_i)
+            c_coeffs[layer.name] = float(traces[layer.name] * kappa ** 2 / 24.0)
     return c_coeffs
 
 

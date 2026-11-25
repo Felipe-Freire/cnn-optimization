@@ -8,6 +8,15 @@ import tf_keras as keras
 import qkeras
 from qkeras import QActivation, QConv1D, QDense, quantized_bits, quantized_relu
 
+# Integer bits (sign excluded) of the weight, bias and ReLU quantizers for b >= 3 bits.
+# quantized_bits(b, I, alpha=1) covers [-2^I, 2^I) with step 2^(I + 1 - b).
+QUANTIZER_INTEGER_BITS = 2
+
+
+def quantizer_integer_bits(bits: int) -> int:
+    """Integer bits used by the quantizers of the model: min(2, b - 1)."""
+    return min(QUANTIZER_INTEGER_BITS, max(0, int(bits) - 1))
+
 
 def build_compact_cnn1d_fp32(
     input_dim: int = 50,
@@ -82,11 +91,11 @@ def build_compact_qcnn1d(
         a_conv = int(act_bits)
         a_dense = int(act_bits)
 
-    int_w_conv = min(2, max(0, b_conv - 1))
-    int_w_dense = min(2, max(0, b_dense - 1))
-    int_w_out = min(2, max(0, b_out - 1))
-    int_a_conv = min(2, max(0, a_conv - 1))
-    int_a_dense = min(2, max(0, a_dense - 1))
+    int_w_conv = quantizer_integer_bits(b_conv)
+    int_w_dense = quantizer_integer_bits(b_dense)
+    int_w_out = quantizer_integer_bits(b_out)
+    int_a_conv = quantizer_integer_bits(a_conv)
+    int_a_dense = quantizer_integer_bits(a_dense)
 
     model = keras.Sequential([
         keras.layers.Input(shape=(input_dim,), name="input_rings"),

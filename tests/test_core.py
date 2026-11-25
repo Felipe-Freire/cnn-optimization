@@ -16,6 +16,8 @@ from src.hardware import (
 from src.kkt_allocator import (
     LagrangeKKTQuantizerOptimizer,
     check_kkt_stopping_criteria,
+    compute_hutchinson_hessian_trace,
+    compute_layer_c_coefficients,
     solve_kkt_bit_allocation,
 )
 from src.models import build_compact_cnn1d_fp32, build_compact_qcnn1d, transfer_weights_to_qmodel
@@ -63,6 +65,60 @@ def test_kkt_bit_allocation():
 
     # The most sensitive layer should get >= bits than less sensitive high-cost layer
     assert int_bits["conv1d_1"] >= int_bits["dense_1"]
+
+
+def _small_model_and_batch(seed: int = 0):
+    tf.random.set_seed(seed)
+    model = build_compact_cnn1d_fp32(input_dim=25, num_filters=4, kernel_size=3, dense_units=4)
+    rng = np.random.default_rng(seed)
+    x = rng.random((256, 25)).astype(np.float32)
+    x /= x.sum(axis=1, keepdims=True)
+    y = (x[:, :12].sum(axis=1) > 0.48).astype(np.float32)[:, None]
+    return model, tf.constant(x), tf.constant(y)
+
+
+def _exact_hessian_block(model, loss_fn, x, y, layer):
+    var = layer.kernel
+    n = int(np.prod(var.shape))
+    with tf.GradientTape(persistent=True) as outer:
+        with tf.GradientTape() as inner:
+            loss = loss_fn(y, model(x, training=False))
+        grad = tf.reshape(inner.gradient(loss, var), [-1])
+    jac = outer.jacobian(grad, var, experimental_use_pfor=False)
+    return tf.reshape(jac, [n, n]).numpy().astype(np.float64)
+
+
+def test_hutchinson_probes_each_layer_block_alone():
+    """The estimate is the mean of z^T H_ll z over the draws of that layer, with no cross-layer terms."""
+    model, x, y = _small_model_and_batch()
+    loss_fn = tf.keras.losses.BinaryCrossentropy()
+    num_hvp, seed = 8, 3
+    numpy_state = np.random.get_state()[1].copy()
+
+    traces = compute_hutchinson_hessian_trace(model, loss_fn, x, y, num_hvp=num_hvp, seed=seed)
+
+    assert np.array_equal(np.random.get_state()[1], numpy_state)  # global RNG untouched
+    rng = np.random.default_rng(seed)  # same draw order: layer by layer, num_hvp draws each
+    for layer in [l for l in model.layers if getattr(l, "kernel", None) is not None]:
+        h = _exact_hessian_block(model, loss_fn, x, y, layer)
+        draws = [rng.choice([-1.0, 1.0], size=layer.kernel.shape).ravel() for _ in range(num_hvp)]
+        expected = float(np.mean([z @ h @ z for z in draws]))
+        assert traces[layer.name] == pytest.approx(max(expected, 1e-8), rel=1e-3, abs=1e-9)
+
+
+def test_layer_c_coefficients_do_not_depend_on_layer_size_or_weight_range():
+    """c_l = Tr(H_ll) kappa^2 / 24: the full trace already sums over the n_l weights, and the
+    trained quantizer has a fixed range [-4, 4) (kappa = 8), whatever max|W_l| is."""
+    model = build_compact_cnn1d_fp32(input_dim=25, num_filters=8, kernel_size=3, dense_units=8)
+    names = ["conv1d_1", "dense_1", "output_dense"]
+    c = compute_layer_c_coefficients(model, {name: 1.0 for name in names})
+    for name in names:
+        assert c[name] == pytest.approx(64.0 / 24.0)
+
+    dense = model.get_layer("dense_1")
+    kernel, bias = dense.get_weights()
+    dense.set_weights([10.0 * kernel, bias])
+    assert compute_layer_c_coefficients(model, {"dense_1": 3.0})["dense_1"] == pytest.approx(3.0 * 64.0 / 24.0)
 
 
 def test_models_forward_pass():

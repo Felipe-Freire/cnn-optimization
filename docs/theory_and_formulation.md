@@ -63,26 +63,30 @@ Em vez de forçar quantização uniforme ($b_i = 8$ bits em todas as camadas), a
 
 ### 3.1 Modelo da Perturbação e Sensibilidade Hessiana
 
-Um quantizador uniforme simétrico de $b_i$ bits sobre o intervalo $[-r_i, r_i)$ possui passo de quantização:
+Os pesos e bias da camada $i$ são quantizados por `quantized_bits(b_i, I, alpha=1)` (`src/models.py`), com $I = 2$ bits inteiros para $b_i \ge 3$. A faixa é fixa, $[-2^I, 2^I)$, de largura $\kappa = 2^{I+1} = 8$, e o passo é:
 
-$$\Delta_i = \frac{2 r_i}{2^{b_i}} = 2 r_i \cdot 2^{-b_i}$$
+$$\Delta_i = \kappa \cdot 2^{-b_i} = 2^{I + 1 - b_i}$$
 
 Sob a hipótese de ruído de arredondamento uniforme, a variância do erro de quantização de cada peso é $\sigma^2 = \frac{\Delta_i^2}{12}$. Para os $n_i$ parâmetros da camada $i$:
 
-$$\|\mathbf{W}_{q,i} - \mathbf{W}_i\|_2^2 \approx n_i \frac{\Delta_i^2}{12} = \frac{n_i r_i^2}{3} 2^{-2 b_i} = \frac{n_i r_i^2}{3} 4^{-b_i}$$
+$$\|\mathbf{W}_{q,i} - \mathbf{W}_i\|_2^2 \approx n_i \frac{\Delta_i^2}{12} = \frac{n_i \kappa^2}{12} 4^{-b_i}$$
 
-Pela expansão de Taylor de segunda ordem da função de perda $\mathcal{L}$ em torno do ponto de mínimo ($\nabla_{\mathbf{W}} \mathcal{L} \approx \mathbf{0}$):
+Pela expansão de Taylor de segunda ordem da função de perda $\mathcal{L}$ em torno do ponto de mínimo ($\nabla_{\mathbf{W}} \mathcal{L} \approx \mathbf{0}$), e como os erros de arredondamento de pesos diferentes são independentes e de média nula (só a diagonal de $\mathbf{H}$ contribui em média):
 
-$$\Delta \mathcal{L} \approx \frac{1}{2} \Delta \mathbf{W}^T \mathbf{H} \, \Delta \mathbf{W} \approx \sum_i \Omega_i(b_i)$$
+$$\Delta \mathcal{L} \approx \frac{1}{2} \Delta \mathbf{W}^T \mathbf{H} \, \Delta \mathbf{W} \approx \sum_i \frac{1}{2} \, \frac{\operatorname{Tr}(\mathbf{H}_i)}{n_i} \, \|\mathbf{W}_{q,i} - \mathbf{W}_i\|_2^2 = \sum_i \Omega_i(b_i)$$
 
-$$\Omega_i(b_i) \approx c_i 4^{-b_i}, \quad \text{onde } c_i = \operatorname{Tr}(\mathbf{H}_i) \frac{n_i r_i^2}{3}$$
+onde $\operatorname{Tr}(\mathbf{H}_i)$ é o traço **total** do bloco diagonal da camada (soma sobre os $n_i$ pesos) e $\operatorname{Tr}(\mathbf{H}_i)/n_i$ é a curvatura média, como em HAWQ-V2/V3 e Campos et al. O fator $n_i$ do erro cancela com o da curvatura média:
+
+$$\Omega_i(b_i) \approx c_i 4^{-b_i}, \quad \text{onde } c_i = \frac{\operatorname{Tr}(\mathbf{H}_i) \, \kappa^2}{24}$$
+
+A constante $\frac{1}{2}$ e o valor de $\kappa$ (comum a todas as camadas) só mudam a escala de $\Omega$ e do multiplicador $\lambda$; a alocação depende das razões $c_i / a_i$.
 
 #### Estimativa do Traço da Hessiana via Algoritmo de Hutchinson (HVP)
-Como calcular a matriz Hessiana completa $\mathbf{H} \in \mathbb{R}^{P \times P}$ é inviável, o traço $\operatorname{Tr}(\mathbf{H}_i)$ é estimado sem formar a matriz através de produtos Hessiana-vetor (HVP) com vetores aleatórios de Rademacher $\mathbf{z} \in \{-1, +1\}^P$:
+Como calcular a matriz Hessiana completa $\mathbf{H} \in \mathbb{R}^{P \times P}$ é inviável, o traço $\operatorname{Tr}(\mathbf{H}_i)$ é estimado sem formar a matriz através de produtos Hessiana-vetor (HVP) com vetores aleatórios de Rademacher $\mathbf{z} \in \{-1, +1\}^{n_i}$, sorteados para cada camada separadamente:
 
 $$\operatorname{Tr}(\mathbf{H}_i) \approx \frac{1}{M_H} \sum_{j=1}^{M_H} \mathbf{z}_j^T \left( \nabla^2_{\mathbf{W}_i} \mathcal{L} \, \mathbf{z}_j \right) = \frac{1}{M_H} \sum_{j=1}^{M_H} \mathbf{z}_j^T \nabla_{\mathbf{W}_i} \left( \nabla_{\mathbf{W}_i} \mathcal{L}^T \mathbf{z}_j \right)$$
 
-O cálculo de cada HVP requer apenas duas passagens de gradiente por diferenciação automática, sem custo quadrático de memória.
+O cálculo de cada HVP requer apenas duas passagens de gradiente por diferenciação automática, sem custo quadrático de memória. Um vetor único para todas as camadas somaria os termos cruzados $\mathbf{z}_i^T \mathbf{H}_{ik} \mathbf{z}_k$, de média nula mas com variância alta, o que pode tornar negativa a estimativa de uma camada pequena.
 
 ---
 
