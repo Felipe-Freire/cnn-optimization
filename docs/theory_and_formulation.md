@@ -252,11 +252,12 @@ Com as ativações fixas, cada restrição é linear nos bits dos pesos, $\tilde
 
 ## 5. Ciclo Fechado de Otimização em 3 Etapas (QKeras $\to$ SP/VU13P $\to$ Lagrange/KKT)
 
-O pipeline operacional unifica a teoria das Seções 1 a 4 em um ciclo fechado de três estágios iterativos:
+Objetivo do projeto: **o menor consumo de recursos que preserva o SP** do 8 bits uniforme (tolerância $\varepsilon_{SP} = 0{,}1$ p.p. na validação), dentro do teto da instância da Seção 4. A latência não entra como restrição: no domínio calibrado ela fica entre 9 e 12 ciclos (II = 1) e não cresce quando os bits caem.
 
-1. **Estágio 1 — Rede Neural Quantizada (QKeras)**:
-   - Configura as larguras de bits de pesos ($w_l$), ativações ($a_l$) e unidades ($n_l$) nas camadas `QConv1D` e `QDense`, aplicando transferência de pesos (*Warm-Start* QAT) a partir da referência em ponto flutuante e ajuste fino com decaimento adaptativo de taxa de aprendizado (`ReduceLROnPlateau`).
-2. **Estágio 2 — Avaliação de Desempenho Físico e Custo em Silício**:
-   - Avalia o **Índice-$SP$** no joelho da curva ROC de validação para computar a perda física $\mathcal{L}_{\text{SP}}(\mathbf{x}^{(t)}) = 1 - SP_{\text{val}}(\mathbf{x}^{(t)})$ e estima analiticamente o consumo de `DSP`, `LUT`, `FF` e `BRAM_bits` na FPGA **Virtex UltraScale+ VU13P**.
-3. **Estágio 3 — Núcleo de Otimização Lagrange / KKT**:
-   - Compara os recursos consumidos com os tetos de hardware $B_j$ ($g_j(\mathbf{x}^{(t)}) \le 0$), atualiza os **Preços de Sombra** ($\mu_j^{(t+1)}$) via subgradiente dual com projeção de folga complementar, verifica os critérios de parada KKT e calcula analiticamente a próxima alocação de bits $(w_l^{(t+1)}, a_l^{(t+1)})$ via condição de estacionaridade (*water-filling*).
+O SP só é conhecido depois do QAT, então o laço externo procura o menor orçamento de LUT $B$ cujo ótimo do subproblema (Seção 4.4) ainda preserva o SP, por bisseção em $\log B$ entre o custo com todos os pesos em $b_{\min}$ e o teto. Em cada passo $t$:
+
+1. **Lagrange / KKT**: para $B^{(t)}$, `compute_primal_bit_update` acha os preços-sombra $\mu_j$ por ascensão dual até as condições KKT e devolve o ótimo inteiro, com o custo de cada candidato previsto pelo modelo calibrado a partir dos pesos FP32 (`make_cost_fn`);
+2. **QKeras**: o candidato é treinado com QAT a partir do FP32 (*warm-start*), com a mesma semente e o mesmo número de épocas que o 8 bits uniforme de referência;
+3. **SP e custo**: mede o $SP_{\text{val}}$ e recalcula os recursos com os pesos treinados. Se $SP_{\text{val}} \ge SP^{\text{8b}}_{\text{val}} - \varepsilon_{SP}$ e os recursos cabem no teto, $B$ desce; senão, sobe.
+
+A configuração escolhida é a de menor LUT entre as aceitas; a validação cruzada da Seção 3 do notebook a confirma.

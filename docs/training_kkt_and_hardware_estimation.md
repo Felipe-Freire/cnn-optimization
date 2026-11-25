@@ -89,7 +89,7 @@ A resolução implementada em [`src/kkt_allocator.py`](file:///home/iaraujo/Docu
    - Com $B_{\text{DSP}} = 0$, limita $w_l, a_l \le 8\text{ bits}$ (sem `DSP48E2`). Para os preços $\mu_j$, cada bit de peso da camada $l$ custa $\pi_l = \sum_j \mu_j \, \frac{\partial R_j/\partial w_l}{B_j}$ e a condição de estacionaridade dá:
      $$w_l(\boldsymbol{\mu}) = \operatorname{clip}\!\left( \frac{1}{2} \log_2\!\left( \frac{c_l \ln 4}{\pi_l} \right), \, b_{\min}, \, b_{\max} \right)$$
    - Os preços são ajustados por ascensão dual até a solução contínua satisfazer as condições KKT ([`solve_relaxed_dual`](file:///home/iaraujo/Documentos/Github/cnn-optimization/src/kkt_allocator.py)); os bits inteiros são o ótimo exato da enumeração no modelo de custo.
-   - Converge na **Iteração #5** com `w = {'conv1d_1': 2, 'dense_1': 5, 'output_dense': 8}` e `a = {'conv1d_1': 8, 'dense_1': 8}`.
+   - O notebook procura, por bisseção no orçamento de LUT, o menor custo que preserva o SP do 8 bits uniforme (seção 5 de `theory_and_formulation.md`). Em `et5_eta0` (teto de 1 % da VU13P), a escolha foi `w = [5, 5, 5]`, `a = [8, 8]`, entrada de 8 bits: SP de validação 97,86 % (8 bits uniforme: 97,92 %), 13,6 mil LUTs previstas pelo modelo calibrado (51 % do 8 bits uniforme), 0 DSP. CV em 5 folds: SP 97,80 ± 0,20 %.
 
 ---
 

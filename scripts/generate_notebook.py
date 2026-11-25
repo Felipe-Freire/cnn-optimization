@@ -38,8 +38,20 @@ Todos os artefatos são exportados automaticamente no padrão hierárquico **Jub
 
 # Cell 1: Environment & Imports
 cells.append(nbf.v4.new_code_cell(r"""import os
-os.environ["TF_USE_LEGACY_KERAS"] = "1"
 import sys
+os.environ["TF_USE_LEGACY_KERAS"] = "1"
+
+# Adicionar raiz do repositório ao PYTHONPATH
+repo_root = os.path.abspath(os.path.join(os.getcwd(), '..'))
+if not os.path.exists(os.path.join(repo_root, 'src')):
+    repo_root = os.path.abspath(os.getcwd())
+if repo_root not in sys.path:
+    sys.path.insert(0, repo_root)
+
+# GPU CUDA se o TensorFlow conseguir executar nela; caso contrário, CPU (antes de importar o TensorFlow)
+from src.device import select_device
+DEVICE = select_device()
+
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
@@ -48,14 +60,6 @@ import tf_keras as keras
 import qkeras
 from sklearn.model_selection import StratifiedKFold, train_test_split
 from sklearn.metrics import roc_curve, auc
-
-# Adicionar raiz do repositório ao PYTHONPATH
-repo_root = os.path.abspath(os.path.join(os.getcwd(), '..'))
-if not os.path.exists(os.path.join(repo_root, 'src')):
-    repo_root = os.path.abspath(os.getcwd())
-
-if repo_root not in sys.path:
-    sys.path.insert(0, repo_root)
 
 from src.metrics import (
     ESTRUTURA_BASE,
@@ -69,14 +73,14 @@ from src.metrics import (
 from src.hardware import (
     VU13P_CHIP_LIMITS,
     VU13P_LIMITS,
+    get_cost_model,
     get_vu13p_budget,
-    estimate_hardware_resources,
     compute_model_hardware_costs,
+    make_cost_fn,
 )
 from src.kkt_allocator import (
     compute_hutchinson_hessian_trace,
     compute_layer_c_coefficients,
-    solve_kkt_bit_allocation,
     LagrangeKKTQuantizerOptimizer,
     check_kkt_stopping_criteria,
 )
@@ -106,13 +110,14 @@ tf.random.set_seed(SEED)
 
 print("TensorFlow Version:", tf.__version__)
 print("QKeras Version:", qkeras.__version__)
+print("Dispositivo:", DEVICE)
 print("Repository Root:", repo_root)
 """))
 
 # Cell 2: Section 1 - Data Ingestion, Ring Slicing & VU13P Hardware Limits
 cells.append(nbf.v4.new_markdown_cell(r"""## 1. Ingestão de Dados Ringer (`v2` = 25 Anéis) e Limites de Recursos na FPGA VU13P
 
-Configuramos a região cinemática $(\text{iet}=5, \text{ieta}=0)$, aplicamos o fatiamento físico da topologia `v2` (25 anéis internos do calorímetro) com normalização $L_1$, e definimos os limites de recursos $B_j$ na FPGA **AMD/Xilinx Virtex UltraScale+ VU13P (Tabela 15)**.
+Configuramos a região cinemática $(\text{iet}=5, \text{ieta}=0)$, aplicamos o fatiamento físico da topologia `v2` (25 anéis internos do calorímetro) com normalização $L_1$, e definimos o teto de recursos da instância na FPGA **AMD/Xilinx Virtex UltraScale+ VU13P (Tabela 15)**: uma única rede, que divide o chip com outros algoritmos do trigger, recebe no máximo 1 % de cada recurso, dividido pela margem do modelo de custo calibrado ($B_j = 0{,}01\,B_{j,\text{chip}} / (1 + m_j)$).
 """))
 
 cells.append(nbf.v4.new_code_cell(r"""# ==============================================================================
@@ -125,7 +130,21 @@ IET = 5
 IETA = 0
 VERSION = 2        # 0 (100 anéis), 1 (50 anéis), ou 2 (25 anéis)
 N_SPLITS = 5       # Folds para validação cruzada
-EPOCHS_CV = 18     # Épocas por fold com Warm-Start e ReduceLROnPlateau
+EPOCHS_CV = 25     # Épocas por fold com Warm-Start e ReduceLROnPlateau
+QAT_EPOCHS = 8     # Épocas de QAT por candidato no laço de alocação
+
+# Dados: diretório com os arquivos <DATASET_PREFIX>.et<IET>_eta<IETA>.h5 (variável RINGER_DATA_DIR)
+DATA_DIR = os.environ.get("RINGER_DATA_DIR", os.path.join(repo_root, "data"))
+
+# Precisões fixas neste laço: entrada sem sinal ufixed<8,0> e ReLUs de 8 bits
+INPUT_BITS = 8
+ACT_BITS = {"conv1d_1": 8, "dense_1": 8}
+
+# Critério de seleção: menor custo cujo SP de validação fica no máximo 0,1 p.p. abaixo do 8 bits uniforme
+SP_TOLERANCE = 1e-3
+MAX_BUDGET_STEPS = 8      # passos da bisseção no orçamento de LUT
+BUDGET_REL_TOL = 0.03     # para quando o intervalo de orçamento fica abaixo de 3 %
+INSTANCE_FRACTION = 0.01  # teto: 1 % de cada recurso da VU13P
 
 cfg_versao = CONFIG_VERSOES[VERSION]
 input_dim = cfg_versao["input_dim"]
@@ -133,18 +152,18 @@ kernel_size = cfg_versao["kernel"]
 num_filters = cfg_versao["filters"]
 dense_units = cfg_versao["dense_units"]
 
-# Orçamento estrito para a instância do classificador L0 Ringer na FPGA VU13P
-VU13P_INSTANCE_BUDGET = get_vu13p_budget({
-    "DSP": 0.0,          # Zero DSPs (obriga síntese sub-byte <= 8b em CLB LUTs)
-    "LUT": 2500.0,       # Teto de 2.500 LUTs (8-bit uniforme requer 4.892 LUTs -> exige compressão KKT)
-    "FF": 10000.0,       # Teto de 10.000 Flip-Flops
-    "BRAM_bits": 5500.0  # Teto de 5.500 bits de memória de pesos (8-bit uniforme requer 6.536 bits)
-})
+# Teto da instância: 1 % do chip por recurso, dividido pela margem do modelo de custo calibrado
+COST_MODEL = get_cost_model()
+VU13P_INSTANCE_BUDGET = get_vu13p_budget(
+    {k: INSTANCE_FRACTION for k in VU13P_LIMITS}, margins=COST_MODEL.margins
+)
 
 df_vu13p = pd.DataFrame([
     {
         "Recurso FPGA (VU13P)": k,
         "Capacidade Total Chip (Tabela 15)": f"{VU13P_LIMITS[k]:,.0f}",
+        "1 % do Chip": f"{INSTANCE_FRACTION * VU13P_LIMITS[k]:,.0f}",
+        "Margem do Modelo de Custo": f"{COST_MODEL.margins.get(k, 0.0) * 100:.1f} %",
         "Orçamento da Instância (B_j)": f"{VU13P_INSTANCE_BUDGET[k]:,.0f}",
     }
     for k in VU13P_LIMITS.keys()
@@ -160,7 +179,7 @@ exporter = ArtifactExporter(
     version=VERSION,
 )
 
-data_path = os.path.join(repo_root, "data", f"{DATASET_PREFIX}.et{IET}_eta{IETA}.h5")
+data_path = os.path.join(DATA_DIR, f"{DATASET_PREFIX}.et{IET}_eta{IETA}.h5")
 df_loaded = pd.read_hdf(data_path, key="data")
 
 ring_columns = sorted(
@@ -203,22 +222,24 @@ print(f"Conjunto de Desenvolvimento (CV): {X_dev.shape} | Conjunto Holdout Isola
 # Cell 3: Section 2 - 3-Stage Closed-Loop Optimization (QKeras -> SP/VU13P -> Lagrange/KKT)
 cells.append(nbf.v4.new_markdown_cell(r"""## 2. Ciclo Fechado de Otimização em 3 Etapas: QKeras $\to$ SP & VU13P $\to$ Lagrange/KKT
 
-Formulamos o Lagrangiano multi-recurso acoplando a perda pelo **Índice-$SP$** existente ($\mathcal{L}_{\text{SP}}(\mathbf{x}) = 1 - SP_{\text{val}}(\mathbf{x})$) e as restrições normalizadas da VU13P ($g_j(\mathbf{x}) \le 0$):
+Objetivo: **o menor consumo de recursos que mantém o SP** do 8 bits uniforme (tolerância de 0,1 p.p. na validação), dentro do teto da instância. A latência não entra como restrição: no domínio calibrado (hls4ml `io_parallel`, `ReuseFactor=1`) ela fica entre 9 e 12 ciclos e não cresce quando os bits caem.
 
-$$\mathcal{L}(\mathbf{x}, \boldsymbol{\mu}) = \left(1 - SP_{\text{val}}(\mathbf{x})\right) + \mu_{\text{DSP}} g_{\text{DSP}}(\mathbf{x}) + \mu_{\text{LUT}} g_{\text{LUT}}(\mathbf{x}) + \mu_{\text{FF}} g_{\text{FF}}(\mathbf{x}) + \mu_{\text{BRAM}} g_{\text{BRAM}}(\mathbf{x})$$
+Para um orçamento de LUT $B$, o subproblema usa a sensibilidade de Hessiana $\Omega(\mathbf{w}) = \sum_l c_l 4^{-w_l}$ como substituto de $1 - SP$:
 
-Em cada iteração $t$:
-1. **Passo 1 — Rede Neural Quantizada (QKeras)**: Configura $(w_l^{(t)}, a_l^{(t)}, n_l)$, transfere os pesos de referência (*Warm-Start* QAT) e executa o ajuste fino;
-2. **Passo 2 — Avaliação de Desempenho e Custo**: Calcula a perda física $1 - SP_{\text{val}}(\mathbf{x}^{(t)})$ e estima o consumo de `DSP`, `LUT`, `FF` e `BRAM_bits` na VU13P;
-3. **Passo 3 — Núcleo de Otimização Lagrange / KKT**: Avalia $g_j(\mathbf{x}^{(t)}) \le 0$, atualiza os Preços de Sombra $\mu_j^{(t+1)}$ com projeção de folga complementar, verifica o critério de parada KKT e calcula analiticamente a próxima alocação de bits $(w_l^{(t+1)}, a_l^{(t+1)})$ via `compute_primal_bit_update`.
+$$\min_{\mathbf{w}} \sum_l c_l 4^{-w_l} \quad \text{s.a.} \quad \tilde{g}_j(\mathbf{w}) = \frac{R_j(\mathbf{w}) - B_j}{B_j} \le 0, \qquad R_j \text{ do modelo de custo calibrado}$$
+
+Em cada passo $t$:
+1. **Lagrange/KKT**: para o orçamento $B^{(t)}$, `compute_primal_bit_update` acha os preços-sombra $\mu_j$ por ascensão dual até as condições KKT e devolve o ótimo inteiro;
+2. **QKeras**: o candidato é treinado com QAT (*warm-start* do FP32, mesma semente para todos);
+3. **SP e custo**: mede o SP de validação e recalcula os recursos com os pesos treinados. Se o SP se mantém e cabe no teto, o orçamento desce; se não, sobe (bisseção em $\log B$).
 """))
 
-cells.append(nbf.v4.new_code_cell(r"""# Split de calibração para o ciclo Primal-Dual
+cells.append(nbf.v4.new_code_cell(r"""# Split de calibração para o laço de alocação
 X_tr_ref, X_val_ref, y_tr_ref, y_val_ref = train_test_split(
     X_dev, y_dev, test_size=0.20, stratify=y_dev, random_state=SEED
 )
 
-# Modelo de referência FP32 para Warm-Start e sensibilidade de 2ª ordem (Hutchinson)
+# Modelo de referência FP32: warm-start do QAT, sensibilidade de 2ª ordem e custo dos candidatos
 model_fp32 = build_compact_cnn1d_fp32(
     input_dim=input_dim,
     num_filters=num_filters,
@@ -237,22 +258,23 @@ history_fp32 = model_fp32.fit(
     epochs=EPOCHS_CV,
     batch_size=512,
     callbacks=[sp_cb_fp32, lr_sched_fp32],
-    verbose=1,
+    verbose=0,
 )
 sp_cb_fp32.restore_best_weights()
-hw_fp32 = compute_model_hardware_costs(model_fp32, input_dim=input_dim)
+hw_fp32 = compute_model_hardware_costs(model_fp32, input_dim=input_dim, input_bits=INPUT_BITS)
 
 y_pred_fp32_holdout = model_fp32.predict(X_holdout, batch_size=2048, verbose=0).ravel()
 sp_fp32_ho, pd_fp32_ho, fa_fp32_ho, thresh_fp32_ho, _ = compute_sp_with_threshold(y_holdout, y_pred_fp32_holdout)
 print(f"\n[Referência FP32 Holdout] SP = {sp_fp32_ho*100:.2f}% | PD = {pd_fp32_ho*100:.2f}% | FA = {fa_fp32_ho*100:.2f}%")
 
-# Sensibilidade Hessiana de Hutchinson Tr(H_l) -> Coeficientes c_l
-sample_idx = np.random.choice(len(X_val_ref), size=512, replace=False)
+# Sensibilidade de Hutchinson Tr(H_l) -> c_l (traço total por camada, sorteios por camada)
+rng_sens = np.random.default_rng(SEED)
+sample_idx = rng_sens.choice(len(X_val_ref), size=min(4096, len(X_val_ref)), replace=False)
 x_sample_tf = tf.convert_to_tensor(X_val_ref[sample_idx])
 y_sample_tf = tf.convert_to_tensor(y_val_ref[sample_idx], dtype=tf.float32)[:, None]
 bce_loss = keras.losses.BinaryCrossentropy()
 
-traces = compute_hutchinson_hessian_trace(model_fp32, bce_loss, x_sample_tf, y_sample_tf, num_hvp=10, seed=SEED)
+traces = compute_hutchinson_hessian_trace(model_fp32, bce_loss, x_sample_tf, y_sample_tf, num_hvp=32, seed=SEED)
 c_coeffs = compute_layer_c_coefficients(model_fp32, traces)
 
 layer_names = [item["layer_name"] for item in hw_fp32["breakdown"]]
@@ -260,77 +282,108 @@ macs_list = [float(item["macs"]) for item in hw_fp32["breakdown"]]
 params_list = [float(item["params"]) for item in hw_fp32["breakdown"]]
 c_list = [c_coeffs[name] for name in layer_names]
 bops_uniform_8bit = sum(m * 64.0 for m in macs_list)
+print("Tr(H_l):", {k: f"{v:.4g}" for k, v in traces.items()})
+print("c_l    :", {k: f"{v:.4g}" for k, v in c_coeffs.items()})
 
-# Inicialização do Núcleo de Otimização Lagrange / KKT na VU13P
-kkt_optimizer = LagrangeKKTQuantizerOptimizer(
-    hardware_limits=VU13P_INSTANCE_BUDGET,
-    lr_x=0.05,
-    lr_mu=0.80,
-    normalize_constraints=True,
+# Custo de cada candidato antes do treino: pesos FP32 quantizados no modelo calibrado
+cost_fn = make_cost_fn(model_fp32, input_bits=INPUT_BITS)
+
+
+def train_qat_candidate(w_bits):
+    # Etapa QKeras: mesma semente e mesmo warm-start para todos os candidatos (comparação pareada)
+    keras.utils.set_random_seed(SEED)
+    q_cand = build_compact_qcnn1d(
+        input_dim=input_dim,
+        num_filters=num_filters,
+        kernel_size=kernel_size,
+        dense_units=dense_units,
+        weights_bits=w_bits,
+        act_bits=ACT_BITS,
+        input_bits=INPUT_BITS,
+        learning_rate=8e-4,
+    )
+    transfer_weights_to_qmodel(model_fp32, q_cand)
+    cb_cand = SPCallback(val_data=(X_val_ref, y_val_ref), patience=5, verbose=False)
+    q_cand.fit(
+        X_tr_ref, y_tr_ref,
+        validation_data=(X_val_ref, y_val_ref),
+        epochs=QAT_EPOCHS,
+        batch_size=512,
+        callbacks=[cb_cand],
+        verbose=0,
+    )
+    cb_cand.restore_best_weights()
+    return float(cb_cand.best_sp), q_cand
+
+
+evaluated = {}
+
+
+def evaluate_candidate(w_bits):
+    # Etapa SP/VU13P: SP de validação e recursos calibrados com os pesos treinados
+    key = tuple(int(w_bits[name]) for name in layer_names)
+    if key not in evaluated:
+        sp_val, q_cand = train_qat_candidate(w_bits)
+        hw_cand = compute_model_hardware_costs(
+            q_cand, weights_bits=w_bits, act_bits=ACT_BITS, input_dim=input_dim, input_bits=INPUT_BITS
+        )
+        evaluated[key] = {
+            "w_bits": {name: int(w_bits[name]) for name in layer_names},
+            "sp_val": sp_val,
+            "resources": {k: float(v) for k, v in hw_cand["vu13p_resources"].items()},
+        }
+    return evaluated[key]
+
+
+def fits_instance(resources):
+    return all(resources[r] <= VU13P_INSTANCE_BUDGET[r] for r in ("DSP", "LUT", "FF"))
+
+
+# Referência de precisão: 8 bits uniforme treinado da mesma forma
+w_8bit = {name: 8 for name in layer_names}
+ref_8bit = evaluate_candidate(w_8bit)
+SP_TARGET = ref_8bit["sp_val"] - SP_TOLERANCE
+print(
+    f"\n[8 bits uniforme] SP_val = {ref_8bit['sp_val']*100:.2f}% | LUT = {ref_8bit['resources']['LUT']:,.0f} | "
+    f"FF = {ref_8bit['resources']['FF']:,.0f} | DSP = {ref_8bit['resources']['DSP']:.0f} -> alvo SP_val >= {SP_TARGET*100:.2f}%"
 )
 
-# Ponto inicial primal (t=1): Alta precisão (16 bits em pesos e ativações)
-w_cfg = {"conv1d_1": 16, "dense_1": 16, "output_dense": 16}
-a_cfg = {"conv1d_1": 16, "dense_1": 16}
-
+# Etapa Lagrange/KKT dentro de uma bisseção no orçamento de LUT
+kkt_optimizer = LagrangeKKTQuantizerOptimizer(hardware_limits=dict(VU13P_INSTANCE_BUDGET), lr_mu=0.80)
+lut_low = cost_fn({name: 2 for name in layer_names}, ACT_BITS)["LUT"]
+lut_high = min(VU13P_INSTANCE_BUDGET["LUT"], cost_fn(w_8bit, ACT_BITS)["LUT"])
+best = None
 sp_history_kkt = []
-cached_eval = {}
-last_kkt_sol = {}
-MAX_PRIMAL_DUAL_ITERS = 8
 
-print("\n=== Iniciando Ciclo Fechado de 3 Etapas: QKeras -> SP/VU13P -> Lagrange/KKT ===")
-for t_step in range(1, MAX_PRIMAL_DUAL_ITERS + 1):
-    cfg_key = (tuple(sorted(w_cfg.items())), tuple(sorted(a_cfg.items())))
-
-    # --------------------------------------------------------------------------
-    # ETAPA 1: REDE NEURAL QUANTIZADA (QKeras) - Configura (w_l, a_l, n_l) + Warm-Start
-    # --------------------------------------------------------------------------
-    if cfg_key not in cached_eval:
-        q_cand = build_compact_qcnn1d(
-            input_dim=input_dim,
-            num_filters=num_filters,
-            kernel_size=kernel_size,
-            dense_units=dense_units,
-            weights_bits=w_cfg,
-            act_bits=a_cfg,
-            learning_rate=8e-4,
-        )
-        transfer_weights_to_qmodel(model_fp32, q_cand)
-        cb_cand = SPCallback(val_data=(X_val_ref, y_val_ref), patience=5, verbose=False)
-        q_cand.fit(
-            X_tr_ref, y_tr_ref,
-            validation_data=(X_val_ref, y_val_ref),
-            epochs=8,
-            batch_size=512,
-            callbacks=[cb_cand],
-            verbose=0,
-        )
-        cb_cand.restore_best_weights()
-
-        # ----------------------------------------------------------------------
-        # ETAPA 2: AVALIAÇÃO DE DESEMPENHO (1 - SP) E CUSTO NA VU13P
-        # ----------------------------------------------------------------------
-        hw_cand = compute_model_hardware_costs(q_cand, weights_bits=w_cfg, act_bits=a_cfg, input_dim=input_dim)
-        cached_eval[cfg_key] = (float(cb_cand.best_sp), hw_cand["vu13p_resources"])
-
-    sp_t, res_t = cached_eval[cfg_key]
-    sp_loss_t = 1.0 - sp_t
+print(f"\n=== Bisseção no orçamento de LUT: [{lut_low:,.0f}, {lut_high:,.0f}] ===")
+for t_step in range(1, MAX_BUDGET_STEPS + 1):
+    budget_lut = float(np.sqrt(lut_low * lut_high))
+    kkt_optimizer.limits["LUT"] = budget_lut
+    w_cfg, a_cfg, kkt_sol = kkt_optimizer.compute_primal_bit_update(
+        layer_names=layer_names,
+        c_coeffs=c_list,
+        macs_list=macs_list,
+        params_list=params_list,
+        current_w=w_8bit,
+        current_a=ACT_BITS,
+        b_min=2,
+        b_max=8,
+        input_bits=INPUT_BITS,
+        cost_fn=cost_fn,
+    )
+    cand = evaluate_candidate(w_cfg)
+    sp_t, res_t = cand["sp_val"], cand["resources"]
     sp_history_kkt.append(sp_t)
 
-    # --------------------------------------------------------------------------
-    # ETAPA 3: NÚCLEO DE OTIMIZAÇÃO LAGRANGE / KKT (Limites VU13P & Preços de Sombra μ_j)
-    # --------------------------------------------------------------------------
-    lag_cost_t, g_val_t = kkt_optimizer.lagrangian_penalty(sp_loss=sp_loss_t, resource_usage=res_t)
-    kkt_optimizer.update_multipliers(g_val_t)
-
-    converged_t, kkt_diag_t = check_kkt_stopping_criteria(
+    lag_cost_t, g_val_t = kkt_optimizer.lagrangian_penalty(sp_loss=1.0 - sp_t, resource_usage=res_t)
+    _, kkt_diag_t = check_kkt_stopping_criteria(
         sp_history=sp_history_kkt,
         g_val=g_val_t,
         mu=kkt_optimizer.mu,
         tol_sp=1e-3,
         tol_kkt=2e-2,
         window=2,
-        stationarity_residual=last_kkt_sol.get("stationarity_residual"),
+        stationarity_residual=kkt_sol["stationarity_residual"],
     )
     kkt_optimizer.record_step(
         iteration=t_step,
@@ -343,40 +396,54 @@ for t_step in range(1, MAX_PRIMAL_DUAL_ITERS + 1):
         kkt_diag=kkt_diag_t,
     )
 
-    print(
-        f"  [Iter {t_step}] w={list(w_cfg.values())}b, a={list(a_cfg.values())}b | "
-        f"SP={sp_t*100:.2f}% (1-SP={sp_loss_t:.4f}) | L(x,μ)={lag_cost_t:.4f} | "
-        f"DSP={res_t['DSP']:.0f}, LUT={res_t['LUT']:.0f}, BRAM={res_t['BRAM_bits']:.0f}b | "
-        f"μ=[DSP:{kkt_optimizer.mu['DSP']:.2f}, LUT:{kkt_optimizer.mu['LUT']:.2f}, BRAM:{kkt_optimizer.mu['BRAM_bits']:.2f}] | "
-        f"KKT_OK={converged_t}"
-    )
+    keeps_sp = sp_t >= SP_TARGET
+    accepted = keeps_sp and fits_instance(res_t)
+    if accepted:
+        lut_high = budget_lut
+        if best is None or res_t["LUT"] < best["resources"]["LUT"]:
+            best = {**cand, "kkt_solution": kkt_sol, "budget_lut": budget_lut, "iteration": t_step}
+    else:
+        lut_low = budget_lut
 
-    if converged_t:
-        print(f"  --> Convergência KKT Atingida na Iteração #{t_step} (Estacionaridade SP + Viabilidade Primal + Folga Complementar μ_j*g_j = 0)!")
+    print(
+        f"  [Passo {t_step}] B_LUT={budget_lut:,.0f} | w={list(w_cfg.values())}b | "
+        f"μ_LUT={kkt_optimizer.mu['LUT']:.3g} | KKT resíduo={kkt_sol['stationarity_residual']:.1e} | "
+        f"SP={sp_t*100:.2f}% | LUT={res_t['LUT']:,.0f}, FF={res_t['FF']:,.0f}, DSP={res_t['DSP']:.0f} | "
+        f"{'aceito' if accepted else 'rejeitado'}"
+    )
+    if lut_high / lut_low < 1.0 + BUDGET_REL_TOL:
         break
 
-    # Atualização Primal Dinâmica guiada pelos Preços de Sombra μ_j
-    w_cfg, a_cfg, last_kkt_sol = kkt_optimizer.compute_primal_bit_update(
-        layer_names=layer_names,
-        c_coeffs=c_list,
-        macs_list=macs_list,
-        params_list=params_list,
-        current_w=w_cfg,
-        current_a=a_cfg,
-        b_min=2,
-        b_max=8,
-    )
+if best is None:
+    feasible = [c for c in evaluated.values() if fits_instance(c["resources"])]
+    best = max(feasible, key=lambda c: c["sp_val"])
+    best = {**best, "kkt_solution": {}, "budget_lut": None, "iteration": None}
+    print("Nenhum candidato manteve o SP; usando o de maior SP dentro do teto.")
 
-kkt_weights_bits = dict(w_cfg)
-kkt_act_bits = dict(a_cfg)
+kkt_weights_bits = dict(best["w_bits"])
+kkt_act_bits = dict(ACT_BITS)
+print(
+    f"\nEscolhido: w={list(kkt_weights_bits.values())}b, a={list(kkt_act_bits.values())}b, entrada {INPUT_BITS}b | "
+    f"SP_val = {best['sp_val']*100:.2f}% | LUT = {best['resources']['LUT']:,.0f} "
+    f"({best['resources']['LUT'] / ref_8bit['resources']['LUT'] * 100:.0f}% do 8 bits uniforme)"
+)
 
 kkt_result = {
-    **last_kkt_sol,
+    **best["kkt_solution"],
     "integer_bits": kkt_weights_bits,
     "activation_bits": kkt_act_bits,
+    "input_bits": INPUT_BITS,
     "vu13p_instance_budget": VU13P_INSTANCE_BUDGET,
+    "selection": {
+        "sp_tolerance": SP_TOLERANCE,
+        "sp_target": SP_TARGET,
+        "reference_8bit": ref_8bit,
+        "chosen_budget_lut": best["budget_lut"],
+        "chosen_iteration": best["iteration"],
+        "candidates": list(evaluated.values()),
+    },
     "primal_dual_history": kkt_optimizer.history,
-    "final_multipliers_mu": kkt_optimizer.mu,
+    "final_multipliers_mu": best["kkt_solution"].get("shadow_prices", kkt_optimizer.mu),
     "kkt_stopping_diagnostics": kkt_optimizer.history[-1]["kkt_diagnostics"],
 }
 
@@ -420,6 +487,7 @@ for fold_idx, (tr_idx, val_idx) in enumerate(skf.split(X_dev, y_dev), start=1):
         dense_units=dense_units,
         weights_bits=kkt_weights_bits,
         act_bits=kkt_act_bits,
+        input_bits=INPUT_BITS,
         learning_rate=1e-3,
     )
     transfer_weights_to_qmodel(model_fp32, qmodel_f)
@@ -495,7 +563,7 @@ print(
 y_pred_holdout = best_qmodel.predict(X_holdout, batch_size=2048, verbose=0).ravel()
 sp_ho, pd_ho, fa_ho, thresh_ho, _ = compute_sp_with_threshold(y_holdout, y_pred_holdout)
 hw_qkeras_kkt = compute_model_hardware_costs(
-    best_qmodel, weights_bits=kkt_weights_bits, act_bits=kkt_act_bits, input_dim=input_dim
+    best_qmodel, weights_bits=kkt_weights_bits, act_bits=kkt_act_bits, input_dim=input_dim, input_bits=INPUT_BITS
 )
 
 print(f"\n[Holdout Test Set - Melhor Modelo QKeras KKT (Fold #{best_fold_idx})]")
@@ -528,6 +596,8 @@ exporter.save_metadata(
         },
     },
     seed=SEED,
+    folds_y_true=folds_y_true,
+    folds_y_pred=folds_y_pred,
 )
 """))
 
