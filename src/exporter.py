@@ -166,8 +166,9 @@ class ArtifactExporter:
             w_bits = kkt_result.get("integer_bits") or {
                 item["layer_name"]: item["b_w"] for item in breakdown
             }
+            # b_a is the precision entering a layer, i.e. the activation of the previous layer
             a_bits = kkt_result.get("activation_bits") or {
-                item["layer_name"]: item["b_a"] for item in breakdown if item["layer_name"] != "output_dense"
+                prev["layer_name"]: nxt["b_a"] for prev, nxt in zip(breakdown[:-1], breakdown[1:])
             }
             rings_struct = extra_config.get("rings_structure", {})
             in_dim = sum(rings_struct.values()) if rings_struct else (25 if self.version == 2 else (50 if self.version == 1 else 100))
@@ -205,7 +206,7 @@ class ArtifactExporter:
                     "macs": item.get("macs", 0),
                     "kkt_continuous_bits": round(float(cont_bits.get(lname, item.get("b_w", 8))), 4),
                     "w_bits": item.get("b_w", 8),
-                    "a_bits": item.get("b_a", 8),
+                    "a_in_bits": item.get("b_a", 8),
                     "mult_bits": item.get("mult_bits", item.get("b_w", 8) + item.get("b_a", 8)),
                     "acc_bits": item.get("acc_bits", 20),
                     "acc_int_bits": item.get("acc_int_bits", 8),

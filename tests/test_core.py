@@ -12,6 +12,7 @@ from src.hardware import (
     compute_model_hardware_costs,
     estimate_hardware_resources,
     get_vu13p_budget,
+    layer_input_bits,
 )
 from src.kkt_allocator import (
     LagrangeKKTQuantizerOptimizer,
@@ -119,6 +120,61 @@ def test_layer_c_coefficients_do_not_depend_on_layer_size_or_weight_range():
     kernel, bias = dense.get_weights()
     dense.set_weights([10.0 * kernel, bias])
     assert compute_layer_c_coefficients(model, {"dense_1": 3.0})["dense_1"] == pytest.approx(3.0 * 64.0 / 24.0)
+
+
+LAYERS = ["conv1d_1", "dense_1", "output_dense"]
+MACS = [600.0, 768.0, 8.0]
+PARAMS = [32.0, 776.0, 9.0]
+
+
+def test_layer_input_bits_follow_the_data_path():
+    a_in = layer_input_bits(LAYERS, {"conv1d_1": 5, "dense_1": 3}, input_bits=7)
+    assert a_in == {"conv1d_1": 7, "dense_1": 5, "output_dense": 3}
+
+
+@pytest.mark.parametrize(
+    "act_bits, expected_a_in",
+    [({"conv1d_1": 8, "dense_1": 4}, [8, 8, 4]), ({"conv1d_1": 4, "dense_1": 8}, [8, 4, 8])],
+)
+def test_hardware_costs_use_the_precision_entering_each_layer(act_bits, expected_a_in):
+    """dense_1 multiplies the ReLU of conv1d_1 and output_dense the ReLU of dense_1; QTools agrees."""
+    w_bits = {name: 8 for name in LAYERS}
+    model = build_compact_qcnn1d(input_dim=25, weights_bits=w_bits, act_bits=act_bits, input_bits=8)
+    hw = compute_model_hardware_costs(model, weights_bits=w_bits, act_bits=act_bits, input_dim=25, input_bits=8)
+    qtools_layers = hw["qtools_vu13p_detailed"]["qtools_profile"]["layers"]
+
+    assert [row["b_a"] for row in hw["breakdown"]] == expected_a_in
+    assert [qtools_layers[name]["input_bits"] for name in LAYERS] == expected_a_in
+    assert hw["total_bops"] == sum(m * 8 * a for m, a in zip(MACS, expected_a_in))
+
+
+def test_input_quantizer_matches_the_costed_input_format():
+    """input_bits=b quantizes the rings to quantized_bits(b, 0): step 2^-(b-1) in [-1, 1)."""
+    model = build_compact_qcnn1d(input_dim=25, input_bits=6)
+    x = np.linspace(-0.2, 1.2, 25, dtype=np.float32)[None, :]
+    xq = model.get_layer("input_quant")(x).numpy()
+    step = 2.0 ** -5
+    assert np.allclose(xq / step, np.round(xq / step))
+    assert xq.min() >= -1.0 and xq.max() <= 1.0 - step + 1e-7
+
+    hw = compute_model_hardware_costs(model, input_dim=25, input_bits=6)
+    assert hw["breakdown"][0]["b_a"] == 6
+
+
+def test_primal_update_costs_weight_bits_with_the_input_precision():
+    """A 2-bit ReLU after dense_1 only makes output_dense cheaper: the allocation must fit the LUT
+    budget when each layer is costed with the precision that enters it."""
+    act_bits = {"conv1d_1": 8, "dense_1": 2}
+    opt = LagrangeKKTQuantizerOptimizer({"DSP": 0.0, "LUT": 2500.0, "FF": 10000.0, "BRAM_bits": 5500.0})
+    w, _, _ = opt.compute_primal_bit_update(
+        LAYERS, [0.4, 1.3, 0.01], MACS, PARAMS, {name: 8 for name in LAYERS}, act_bits
+    )
+    a_in = layer_input_bits(LAYERS, act_bits, input_bits=8)
+    used = estimate_hardware_resources([
+        {"w_bits": w[name], "a_bits": a_in[name], "params": p, "macc": m}
+        for name, m, p in zip(LAYERS, MACS, PARAMS)
+    ])
+    assert used["LUT"] <= 2500.0
 
 
 def test_models_forward_pass():

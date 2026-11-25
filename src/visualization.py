@@ -548,7 +548,7 @@ def plot_vu13p_resource_utilization(
     layers = [item["layer_name"] for item in hw_kkt["breakdown"]]
     luts_8b = [item["LUT"] for item in hw_8bit["breakdown"]]
     luts_kkt = [item["LUT"] for item in hw_kkt["breakdown"]]
-    bit_labels = [f"{item['layer_name']}\n(w={item['b_w']}b, a={item['b_a']}b)" for item in hw_kkt["breakdown"]]
+    bit_labels = [f"{item['layer_name']}\n(w={item['b_w']}b, a_in={item['b_a']}b)" for item in hw_kkt["breakdown"]]
 
     x_l = np.arange(len(layers))
     b3 = axes[1].bar(x_l - width / 2, luts_8b, width, label="Uniforme (w=8b, a=8b)", color="#1f4e79", alpha=0.75)

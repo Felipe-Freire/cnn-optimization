@@ -643,7 +643,7 @@ for item in hw_qkeras_kkt["breakdown"]:
         "Tipo": item["layer_type"],
         "Filtros/Unidades (n_l)": item["units"],
         "Bits Pesos (w_l)": item["b_w"],
-        "Bits Ativação (a_l)": item["b_a"],
+        "Bits da Entrada (a_in)": item["b_a"],
         "Parâmetros": item["params"],
         "MACs": item["macs"],
         "BOPs": item["bops"],

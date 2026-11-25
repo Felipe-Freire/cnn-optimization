@@ -62,6 +62,7 @@ def build_compact_qcnn1d(
     weights_bits: Optional[Dict[str, int]] = None,
     act_bits: Union[int, Dict[str, int]] = 8,
     learning_rate: float = 1e-3,
+    input_bits: Optional[int] = None,
 ) -> keras.Model:
     """Builds a simplified compact 1D CNN using QKeras with heterogeneous layer bitwidths (w_l, a_l).
 
@@ -71,8 +72,12 @@ def build_compact_qcnn1d(
         kernel_size: Size of 1D convolutional kernel.
         dense_units: Hidden units in QDense layer (n_2).
         weights_bits: Mapping from layer name to its integer weight bitwidth w_l.
-        act_bits: Global activation bitwidth (int) or per-layer dict {'conv1d_1': a_1, 'dense_1': a_2}.
+        act_bits: Global activation bitwidth (int) or per-layer dict {'conv1d_1': a_1, 'dense_1': a_2},
+            keyed by the layer whose ReLU output is quantized.
         learning_rate: Adam optimizer learning rate.
+        input_bits: If given, the input rings are quantized with quantized_bits(input_bits, 0, alpha=1)
+            (range [-1, 1), the format the hardware cost model assumes for the first layer).
+            None keeps a floating-point input.
 
     Returns:
         Compiled QKeras Model ready for Quantization-Aware Training (QAT).
@@ -97,8 +102,13 @@ def build_compact_qcnn1d(
     int_a_conv = quantizer_integer_bits(a_conv)
     int_a_dense = quantizer_integer_bits(a_dense)
 
-    model = keras.Sequential([
-        keras.layers.Input(shape=(input_dim,), name="input_rings"),
+    input_layers = [keras.layers.Input(shape=(input_dim,), name="input_rings")]
+    if input_bits is not None:
+        input_layers.append(
+            QActivation(quantized_bits(bits=int(input_bits), integer=0, alpha=1), name="input_quant")
+        )
+
+    model = keras.Sequential(input_layers + [
         keras.layers.Reshape((input_dim, 1), name="reshape_1d"),
         QConv1D(
             filters=num_filters,

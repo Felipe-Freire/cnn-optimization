@@ -55,6 +55,35 @@ def get_vu13p_budget(
     return budgets
 
 
+def layer_input_bits(
+    layer_names: List[str],
+    act_bits: Dict[str, int],
+    input_bits: int = 8,
+    default_act_bits: int = 8,
+) -> Dict[str, int]:
+    """Precision of the tensor that ENTERS each compute layer, in data-path order.
+
+    The multiplications of a layer use the precision of its input: the network input for the
+    first layer, the quantized ReLU output of the previous layer for the others. ``act_bits`` is
+    keyed by the layer whose output is quantized ({"conv1d_1": a_1, "dense_1": a_2}), so
+    a_in(conv1d_1) = input_bits, a_in(dense_1) = a_1 and a_in(output_dense) = a_2.
+    """
+    a_in: Dict[str, int] = {}
+    current = int(input_bits)
+    for name in layer_names:
+        a_in[name] = current
+        current = int(act_bits.get(name, default_act_bits))
+    return a_in
+
+
+def _compute_layer_names(model: tf.keras.Model) -> List[str]:
+    return [
+        layer.name for layer in model.layers
+        if ("Conv1D" in layer.__class__.__name__ or "Dense" in layer.__class__.__name__)
+        and hasattr(layer, "kernel")
+    ]
+
+
 def _format_ap_fixed(q_info: Optional[Dict[str, Any]], default_bits: int = 8, default_int: int = 2) -> str:
     """Formats a QTools quantizer dictionary as an HLS C++ ap_fixed / ap_ufixed type string."""
     if not q_info or not isinstance(q_info, dict):
@@ -191,7 +220,8 @@ def estimate_hardware_resources(
       and datapath pipeline registers.
 
     Args:
-        model_config: List of dicts with keys {'w_bits', 'a_bits', 'params', 'macc'}.
+        model_config: List of dicts with keys {'w_bits', 'a_bits', 'params', 'macc'}, where
+            'a_bits' is the precision of the activation ENTERING the layer (see layer_input_bits).
 
     Returns:
         Dict with keys {'DSP', 'LUT', 'FF', 'BRAM_bits'}.
@@ -233,6 +263,7 @@ def estimate_vu13p_detailed_resources(
     reuse_factor: Union[int, Dict[str, int]] = 1,
     clock_mhz: float = 250.0,
     input_dim: Optional[int] = None,
+    input_bits: int = 8,
 ) -> Dict[str, Any]:
     """High-fidelity VU13P resource, accumulator, energy, and latency estimator powered by qkeras.qtools.
 
@@ -243,10 +274,13 @@ def estimate_vu13p_detailed_resources(
     Args:
         model: Built Keras/QKeras Model.
         weights_bits: Optional per-layer weight bitwidth override mapping.
-        act_bits: Global activation bitwidth or per-layer mapping.
+        act_bits: Global activation bitwidth or mapping keyed by the layer whose ReLU output is
+            quantized ({"conv1d_1": a_1, "dense_1": a_2}). Each layer is costed with the
+            precision of its input (see layer_input_bits).
         reuse_factor: Global HLS ReuseFactor (II) or per-layer dict mapping.
         clock_mhz: Target FPGA clock frequency in MHz on the VU13P (default 250 MHz -> 4.0 ns period).
         input_dim: Optional input ring count (inferred from model if None).
+        input_bits: Precision of the rings entering the first layer.
 
     Returns:
         Dictionary containing detailed per-layer microarchitectural breakdown, QTools profile,
@@ -268,7 +302,8 @@ def estimate_vu13p_detailed_resources(
         in_shape = model.input_shape
         input_dim = in_shape[-1] if in_shape is not None else 25
 
-    qtools_profile = extract_qtools_hardware_profile(model, input_bits=fallback_act)
+    a_in = layer_input_bits(_compute_layer_names(model), act_bits_map, input_bits, fallback_act)
+    qtools_profile = extract_qtools_hardware_profile(model, input_bits=input_bits)
     qtools_layers = qtools_profile["layers"]
 
     dummy_x = tf.zeros((1, input_dim))
@@ -305,7 +340,7 @@ def estimate_vu13p_detailed_resources(
                 macs = l_out * k_size * c_in * c_out
                 fan_in = k_size * c_in
                 n_out_elems = l_out * c_out
-                line_buffer_ffs = float(k_size * c_in * q_layer.get("input_bits", fallback_act) * c_out)
+                line_buffer_ffs = float(k_size * c_in * a_in[lname] * c_out)
             else:
                 n_in = int(kernel.shape[0])
                 n_out = int(kernel.shape[1])
@@ -322,7 +357,7 @@ def estimate_vu13p_detailed_resources(
             rf_l = max(1, rf_l)
 
             b_w = int(weights_bits.get(lname, q_layer.get("weight_bits") or 8))
-            b_a = int(act_bits_map.get(lname, q_layer.get("input_bits") or fallback_act))
+            b_a = a_in[lname]
             num_weights = int(layer.count_params())
 
             # Analytical or QTools-extracted multiplier and accumulator widths
@@ -436,6 +471,7 @@ def compute_model_hardware_costs(
     input_dim: Optional[int] = None,
     reuse_factor: Union[int, Dict[str, int]] = 1,
     clock_mhz: float = 250.0,
+    input_bits: int = 8,
 ) -> Dict[str, Any]:
     """Compute theoretical hardware costs, Virtex UltraScale+ VU13P resources, and QTools metrics.
 
@@ -443,6 +479,10 @@ def compute_model_hardware_costs(
     'total_weight_bits', 'total_params', 'vu13p_resources', 'breakdown') while enriching each
     layer and the top-level dictionary with `qkeras.qtools` accumulator bitwidths, energy (pJ),
     and VU13P pipeline latency (cycles and ns).
+
+    ``act_bits`` is keyed by the layer whose ReLU output is quantized; each layer is costed with
+    the precision of its input (layer_input_bits), reported as ``b_a`` in the breakdown, so
+    BOPs = sum_l MAC_l * w_l * a_in,l. ``input_bits`` is the precision of the input rings.
     """
     if weights_bits is None:
         weights_bits = {}
@@ -461,6 +501,7 @@ def compute_model_hardware_costs(
         in_shape = model.input_shape
         input_dim = in_shape[-1] if in_shape is not None else 50
 
+    a_in = layer_input_bits(_compute_layer_names(model), act_bits_map, input_bits, fallback_act)
     detailed_qtools = estimate_vu13p_detailed_resources(
         model=model,
         weights_bits=weights_bits,
@@ -468,6 +509,7 @@ def compute_model_hardware_costs(
         reuse_factor=reuse_factor,
         clock_mhz=clock_mhz,
         input_dim=input_dim,
+        input_bits=input_bits,
     )
     detailed_by_name = {item["layer_name"]: item for item in detailed_qtools["layers"]}
 
@@ -505,7 +547,7 @@ def compute_model_hardware_costs(
                 units_or_filters = n_out
 
             b_w = int(weights_bits.get(layer.name, default_weight_bits))
-            b_a = int(act_bits_map.get(layer.name, fallback_act))
+            b_a = a_in[layer.name]
             bops = macs * b_w * b_a
             num_weights = int(layer.count_params())
             weight_bits = num_weights * b_w

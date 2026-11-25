@@ -5,6 +5,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 import numpy as np
 import tensorflow as tf
 
+from src.hardware import layer_input_bits
 from src.models import QUANTIZER_INTEGER_BITS
 
 MIN_TRACE = 1e-8
@@ -329,8 +330,12 @@ class LagrangeKKTQuantizerOptimizer:
         current_a: Dict[str, int],
         b_min: int = 2,
         b_max: int = 8,
+        input_bits: int = 8,
     ) -> Tuple[Dict[str, int], Dict[str, int], Dict[str, Any]]:
         """Computes the next primal configuration (w_l^{(t+1)}, a_l^{(t+1)}) from current shadow prices mu_j.
+
+        ``current_a`` is keyed by the layer whose ReLU output is quantized; the cost of a weight bit
+        of layer l is MAC_l * a_in,l, with a_in,l the precision entering l (layer_input_bits).
 
         Follows KKT stationarity on the VU13P:
         1. If mu_DSP > 0 or B_DSP == 0: enforces sub-byte arithmetic (w_l <= 8, a_l <= 8) so DSP = 0.
@@ -354,7 +359,8 @@ class LagrangeKKTQuantizerOptimizer:
             return next_w, next_a, {"regime": "sub_byte_8bit_projection"}
 
         # 3. When LUT or BRAM shadow prices are active, solve KKT water-filling under VU13P LUT/BRAM ceiling
-        a_bits_vec = np.array([float(current_a.get(name, 8)) for name in layer_names], dtype=np.float64)
+        a_in = layer_input_bits(layer_names, current_a, input_bits)
+        a_bits_vec = np.array([float(a_in[name]) for name in layer_names], dtype=np.float64)
         macs_vec = np.array(macs_list, dtype=np.float64)
         a_costs = (macs_vec * a_bits_vec).tolist()
 
@@ -379,7 +385,7 @@ class LagrangeKKTQuantizerOptimizer:
 
         # Check resulting LUT usage with current_a; if LUT > lut_limit, quantize dense activation to 6 bits
         est_bops_with_cur_a = sum(
-            macs_list[i] * next_w[name] * current_a.get(name, 8)
+            macs_list[i] * next_w[name] * a_in[name]
             for i, name in enumerate(layer_names)
         )
         est_luts = est_bops_with_cur_a / 18.0
