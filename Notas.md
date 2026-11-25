@@ -19,11 +19,12 @@ Implementar um modelo simplificado de CNN1D voltada para futura implementação 
 2. **Ciclo Fechado Primal-Dual via Multiplicadores de Lagrange e Condições KKT na VU13P**:
    - Estimativa estocástica livre de matriz do traço da Hessiana $\operatorname{Tr}(\mathbf{H}_l)$ por camada utilizando o **algoritmo de Hutchinson** com vetores de Rademacher;
    - Mapeamento físico de recursos para a FPGA **Virtex UltraScale+ VU13P (Tabela 15)** (`DSP: 12.288`, `LUT: 1.728.000`, `FF: 3.456.000`, `BRAM: 94,5 Mb`), avaliando as restrições $g_j(\mathbf{x}) \le 0$;
-   - Atualização iterativa dos Preços de Sombra ($\mu_{\text{DSP}}, \mu_{\text{LUT}}, \mu_{\text{FF}}, \mu_{\text{BRAM}}$) acoplada ao passo primal analítico (*water-filling*) e *Warm-Start* QAT no QKeras, com o modelo de custo calibrado na síntese e teto de 1 % da VU13P. A alocação que preserva o SP do 8 bits uniforme com menor custo é `w = [5b, 5b, 5b]`, `a = [8b, 8b]`, entrada de 8 bits: **0 DSP**, **13,6 mil LUTs** previstas ($-49\%$ frente a 8 bits uniforme), SP de validação 97,86 % (8 bits: 97,92 %).
+   - Atualização iterativa dos Preços de Sombra ($\mu_{\text{DSP}}, \mu_{\text{LUT}}, \mu_{\text{FF}}, \mu_{\text{BRAM}}$) acoplada ao passo primal analítico (*water-filling*) e *Warm-Start* QAT no QKeras, com o modelo de custo calibrado na síntese e teto de 1 % da VU13P. A alocação que preserva o SP do 8 bits uniforme com menor custo é `w = [5b, 4b, 3b]`, `a = [8b, 8b]`, entrada de 8 bits: **0 DSP**, **9,3 mil LUTs** previstas ($-60\%$ frente a 8 bits uniforme).
 
 3. **Validação Estatística ($K$-Fold Cross-Validation + Holdout) Orientada pelo Índice-$SP$ Existente**:
    - Monitoramento, função objetivo primal ($\mathcal{L}_{\text{SP}} = 1 - SP_{\text{val}}$) e *early stopping* guiados diretamente pelo **Índice Soma-Produto ($SP$)** no ponto de joelho (*knee*) da curva ROC;
-   - Execução de validação cruzada estratificada ($K=5$ folds) com *Warm-Start* e `ReduceLROnPlateau`, seguida de avaliação final em conjunto *Holdout* isolado ($20\%$).
+   - Validação cruzada estratificada pareada ($K=5$ folds): FP32 de *warm-start* treinado por fold, FP32, 8 bits uniforme e a alocação nos mesmos folds; diferença pareada alocação − 8 bits de −0,05 ± 0,04 p.p. (erro padrão 0,02);
+   - Holdout isolado ($20\%$) avaliado no limiar escolhido na validação de cada fold (média dos folds): alocação 97,70 %, 8 bits 97,75 %, FP32 97,71 %.
 
 4. **Padronização Hierárquica de Artefatos (Padrão Jubiaba) e Suíte de Visualizações (`codeTCC` + `VU13P`)**:
    - Exportação estruturada em `<export_dir>/<dataset_prefix>/<model_name>/iet{iet}/ieta{ieta}/v{version}/` contendo `saved_models/` (`.keras` por fold e `.onnx`), `plots/`, `history/` (`.csv`/`.json`), `metadata/` (`.pkl`, `.json`, `.csv`) e `evaluation/` (`.npz`);

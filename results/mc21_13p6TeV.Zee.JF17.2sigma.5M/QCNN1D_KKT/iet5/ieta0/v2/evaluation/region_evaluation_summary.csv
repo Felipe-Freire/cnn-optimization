@@ -1,2 +1,2 @@
 dataset_prefix,model_name,iet,ieta,version,n_folds,cv_sp_mean_pct,cv_sp_std_pct,cv_pd_mean_pct,cv_fa_mean_pct,cv_auc_mean,holdout_kkt_sp_pct,holdout_kkt_pd_pct,holdout_kkt_fa_pct,holdout_kkt_threshold,holdout_fp32_sp_pct,holdout_fp32_pd_pct,holdout_fp32_fa_pct,vu13p_DSP,vu13p_LUT,vu13p_FF,vu13p_BRAM_bits,total_bops,total_energy_core_pj,total_latency_ns
-mc21_13p6TeV.Zee.JF17.2sigma.5M,QCNN1D_KKT,5,0,v2,5,97.7985,0.1964,98.6775,3.0762,0.994512,97.9368,98.7553,2.8783,0.61878,97.9963,98.496,2.5023,0.0,13754.72,5098.69,18432.0,55040,292.0,72.0
+mc21_13p6TeV.Zee.JF17.2sigma.5M,QCNN1D_KKT,5,0,v2,5,97.7219,0.2523,98.7131,3.2642,0.993918,97.7049,98.7268,3.3113,0.727975,97.7147,98.8539,3.4176,0.0,9431.74,3302.6,18432.0,48768,268.0,72.0

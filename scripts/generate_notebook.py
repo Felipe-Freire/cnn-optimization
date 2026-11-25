@@ -70,6 +70,7 @@ from src.metrics import (
     compute_sp_with_threshold,
     SPCallback,
 )
+from src.training import evaluate_model, paired_difference, train_fp32, train_qat
 from src.hardware import (
     VU13P_CHIP_LIMITS,
     VU13P_LIMITS,
@@ -105,8 +106,8 @@ from src.visualization import (
 )
 
 SEED = 42
-np.random.seed(SEED)
-tf.random.set_seed(SEED)
+keras.utils.set_random_seed(SEED)           # Python, NumPy e TensorFlow
+tf.config.experimental.enable_op_determinism()  # mesma execução -> mesmos números
 
 print("TensorFlow Version:", tf.__version__)
 print("QKeras Version:", qkeras.__version__)
@@ -151,6 +152,7 @@ input_dim = cfg_versao["input_dim"]
 kernel_size = cfg_versao["kernel"]
 num_filters = cfg_versao["filters"]
 dense_units = cfg_versao["dense_units"]
+ARCH = {"input_dim": input_dim, "filters": num_filters, "kernel": kernel_size, "dense_units": dense_units}
 
 # Teto da instância: 1 % do chip por recurso, dividido pela margem do modelo de custo calibrado
 COST_MODEL = get_cost_model()
@@ -240,32 +242,16 @@ X_tr_ref, X_val_ref, y_tr_ref, y_val_ref = train_test_split(
 )
 
 # Modelo de referência FP32: warm-start do QAT, sensibilidade de 2ª ordem e custo dos candidatos
-model_fp32 = build_compact_cnn1d_fp32(
-    input_dim=input_dim,
-    num_filters=num_filters,
-    kernel_size=kernel_size,
-    dense_units=dense_units,
-    learning_rate=1.5e-3,
+model_fp32, sp_cb_fp32, history_fp32 = train_fp32(
+    ARCH, X_tr_ref, y_tr_ref, X_val_ref, y_val_ref, epochs=EPOCHS_CV, seed=SEED
 )
-sp_cb_fp32 = SPCallback(val_data=(X_val_ref, y_val_ref), patience=8, verbose=True)
-lr_sched_fp32 = keras.callbacks.ReduceLROnPlateau(
-    monitor="val_loss", factor=0.5, patience=3, min_lr=1e-5, verbose=0
-)
-
-history_fp32 = model_fp32.fit(
-    X_tr_ref, y_tr_ref,
-    validation_data=(X_val_ref, y_val_ref),
-    epochs=EPOCHS_CV,
-    batch_size=512,
-    callbacks=[sp_cb_fp32, lr_sched_fp32],
-    verbose=0,
-)
-sp_cb_fp32.restore_best_weights()
 hw_fp32 = compute_model_hardware_costs(model_fp32, input_dim=input_dim, input_bits=INPUT_BITS)
 
-y_pred_fp32_holdout = model_fp32.predict(X_holdout, batch_size=2048, verbose=0).ravel()
-sp_fp32_ho, pd_fp32_ho, fa_fp32_ho, thresh_fp32_ho, _ = compute_sp_with_threshold(y_holdout, y_pred_fp32_holdout)
-print(f"\n[Referência FP32 Holdout] SP = {sp_fp32_ho*100:.2f}% | PD = {pd_fp32_ho*100:.2f}% | FA = {fa_fp32_ho*100:.2f}%")
+fp32_ref_eval = evaluate_model(model_fp32, X_val_ref, y_val_ref, X_holdout, y_holdout)
+print(
+    f"\n[Referência FP32] SP_val = {fp32_ref_eval['sp_val']*100:.2f}% | holdout no limiar da validação: "
+    f"SP = {fp32_ref_eval['sp_test']*100:.2f}% | PD = {fp32_ref_eval['pd_test']*100:.2f}% | FA = {fp32_ref_eval['fa_test']*100:.2f}%"
+)
 
 # Sensibilidade de Hutchinson Tr(H_l) -> c_l (traço total por camada, sorteios por camada)
 rng_sens = np.random.default_rng(SEED)
@@ -291,28 +277,11 @@ cost_fn = make_cost_fn(model_fp32, input_bits=INPUT_BITS)
 
 def train_qat_candidate(w_bits):
     # Etapa QKeras: mesma semente e mesmo warm-start para todos os candidatos (comparação pareada)
-    keras.utils.set_random_seed(SEED)
-    q_cand = build_compact_qcnn1d(
-        input_dim=input_dim,
-        num_filters=num_filters,
-        kernel_size=kernel_size,
-        dense_units=dense_units,
-        weights_bits=w_bits,
-        act_bits=ACT_BITS,
-        input_bits=INPUT_BITS,
-        learning_rate=8e-4,
+    q_cand, cb_cand, _ = train_qat(
+        ARCH, w_bits, ACT_BITS, INPUT_BITS, model_fp32,
+        X_tr_ref, y_tr_ref, X_val_ref, y_val_ref,
+        epochs=QAT_EPOCHS, learning_rate=8e-4, patience=5, seed=SEED, reduce_lr=False,
     )
-    transfer_weights_to_qmodel(model_fp32, q_cand)
-    cb_cand = SPCallback(val_data=(X_val_ref, y_val_ref), patience=5, verbose=False)
-    q_cand.fit(
-        X_tr_ref, y_tr_ref,
-        validation_data=(X_val_ref, y_val_ref),
-        epochs=QAT_EPOCHS,
-        batch_size=512,
-        callbacks=[cb_cand],
-        verbose=0,
-    )
-    cb_cand.restore_best_weights()
     return float(cb_cand.best_sp), q_cand
 
 
@@ -353,6 +322,7 @@ kkt_optimizer = LagrangeKKTQuantizerOptimizer(hardware_limits=dict(VU13P_INSTANC
 lut_low = cost_fn({name: 2 for name in layer_names}, ACT_BITS)["LUT"]
 lut_high = min(VU13P_INSTANCE_BUDGET["LUT"], cost_fn(w_8bit, ACT_BITS)["LUT"])
 best = None
+accepted = []
 sp_history_kkt = []
 
 print(f"\n=== Bisseção no orçamento de LUT: [{lut_low:,.0f}, {lut_high:,.0f}] ===")
@@ -397,8 +367,9 @@ for t_step in range(1, MAX_BUDGET_STEPS + 1):
     )
 
     keeps_sp = sp_t >= SP_TARGET
-    accepted = keeps_sp and fits_instance(res_t)
-    if accepted:
+    accepted_t = keeps_sp and fits_instance(res_t)
+    if accepted_t:
+        accepted.append(cand)
         lut_high = budget_lut
         if best is None or res_t["LUT"] < best["resources"]["LUT"]:
             best = {**cand, "kkt_solution": kkt_sol, "budget_lut": budget_lut, "iteration": t_step}
@@ -409,7 +380,7 @@ for t_step in range(1, MAX_BUDGET_STEPS + 1):
         f"  [Passo {t_step}] B_LUT={budget_lut:,.0f} | w={list(w_cfg.values())}b | "
         f"μ_LUT={kkt_optimizer.mu['LUT']:.3g} | KKT resíduo={kkt_sol['stationarity_residual']:.1e} | "
         f"SP={sp_t*100:.2f}% | LUT={res_t['LUT']:,.0f}, FF={res_t['FF']:,.0f}, DSP={res_t['DSP']:.0f} | "
-        f"{'aceito' if accepted else 'rejeitado'}"
+        f"{'aceito' if accepted_t else 'rejeitado'}"
     )
     if lut_high / lut_low < 1.0 + BUDGET_REL_TOL:
         break
@@ -456,120 +427,175 @@ plot_primal_dual_kkt_evolution(
 )
 """))
 
-# Cell 4: Section 3 - 5-Fold Cross-Validation with Warm-Start & Holdout Evaluation
-cells.append(nbf.v4.new_markdown_cell(r"""## 3. Treinamento Final em Validação Cruzada ($K=5$ Folds) com *Warm-Start* e Avaliação Holdout
+# Cell 4: Section 3 - Paired 5-fold cross-validation and holdout evaluation
+cells.append(nbf.v4.new_markdown_cell(r"""## 3. Confirmação em Validação Cruzada Pareada ($K=5$ Folds) e Avaliação Holdout
 
-Com a configuração ótima $(w_l^*, a_l^*)$ determinada pelo núcleo Lagrange/KKT, realizamos a validação cruzada estratificada em 5 folds utilizando *Warm-Start* e `ReduceLROnPlateau` para máxima estabilidade estatística, exportando todos os modelos e metadados no padrão **Jubiaba**.
+Protocolo:
+* em cada fold, o FP32 que inicializa o QAT é treinado **só com o treino daquele fold** (as validações dos folds não podem ter sido vistas pelo *warm-start*);
+* FP32, 8 bits uniforme e a alocação escolhida são treinados nos **mesmos folds, com a mesma semente e o mesmo warm-start**, e comparados pela diferença pareada de SP por fold (média, desvio e erro padrão);
+* no holdout, cada modelo é avaliado no **limiar escolhido na sua validação** e o resultado é a média dos folds (escolher o joelho no próprio holdout ou relatar só o melhor fold é otimista).
+
+A alocação é confirmada se a diferença pareada média em relação ao 8 bits uniforme for $\ge -0{,}1$ p.p.; se não for, testa-se o próximo candidato aceito no laço da Seção 2, em ordem de custo.
 """))
 
 cells.append(nbf.v4.new_code_cell(r"""skf = StratifiedKFold(n_splits=N_SPLITS, shuffle=True, random_state=SEED)
+fold_splits = list(skf.split(X_dev, y_dev))
 
-training_results_metadata = []
-cv_records = []
-folds_y_true = []
-folds_y_pred = []
-
-best_overall_sp = -1.0
-best_fold_idx = 1
-best_qmodel = None
-best_history_dict = None
-
-print(f"Iniciando {N_SPLITS}-Fold Cross-Validation para QCNN1D_KKT (w={kkt_weights_bits}, a={kkt_act_bits})...")
-
-for fold_idx, (tr_idx, val_idx) in enumerate(skf.split(X_dev, y_dev), start=1):
-    X_tr_f, y_tr_f = X_dev[tr_idx], y_dev[tr_idx]
-    X_val_f, y_val_f = X_dev[val_idx], y_dev[val_idx]
-
-    qmodel_f = build_compact_qcnn1d(
-        input_dim=input_dim,
-        num_filters=num_filters,
-        kernel_size=kernel_size,
-        dense_units=dense_units,
-        weights_bits=kkt_weights_bits,
-        act_bits=kkt_act_bits,
-        input_bits=INPUT_BITS,
-        learning_rate=1e-3,
+# Referências por fold: FP32 (só treino do fold) e 8 bits uniforme com warm-start desse FP32
+fold_refs = {}
+print(f"Treinando referências por fold (FP32 e 8 bits uniforme, {N_SPLITS} folds)...")
+for fold_idx, (tr_idx, val_idx) in enumerate(fold_splits, start=1):
+    X_tr_f, y_tr_f, X_val_f, y_val_f = X_dev[tr_idx], y_dev[tr_idx], X_dev[val_idx], y_dev[val_idx]
+    fp32_f, _, _ = train_fp32(ARCH, X_tr_f, y_tr_f, X_val_f, y_val_f, epochs=EPOCHS_CV, seed=SEED + fold_idx)
+    u8_f, cb_u8_f, hist_u8_f = train_qat(
+        ARCH, w_8bit, ACT_BITS, INPUT_BITS, fp32_f, X_tr_f, y_tr_f, X_val_f, y_val_f,
+        epochs=EPOCHS_CV, seed=SEED + fold_idx,
     )
-    transfer_weights_to_qmodel(model_fp32, qmodel_f)
-
-    sp_cb_f = SPCallback(val_data=(X_val_f, y_val_f), patience=8, verbose=False)
-    lr_sched_f = keras.callbacks.ReduceLROnPlateau(
-        monitor="val_loss", factor=0.5, patience=3, min_lr=1e-5, verbose=0
-    )
-
-    hist_f = qmodel_f.fit(
-        X_tr_f, y_tr_f,
-        validation_data=(X_val_f, y_val_f),
-        epochs=EPOCHS_CV,
-        batch_size=512,
-        callbacks=[sp_cb_f, lr_sched_f],
-        verbose=0,
-    )
-    sp_cb_f.restore_best_weights()
-
-    fold_model_path = exporter.save_fold_model(qmodel_f, fold=fold_idx, repeat=1)
-
-    y_val_pred = qmodel_f.predict(X_val_f, batch_size=2048, verbose=0).ravel()
-    sp_f, pd_f, fa_f, thresh_f, _ = compute_sp_with_threshold(y_val_f, y_val_pred)
-    fa_curve, pd_curve, _ = roc_curve(y_val_f, y_val_pred)
-    auc_f = float(auc(fa_curve, pd_curve))
-
-    folds_y_true.append(y_val_f)
-    folds_y_pred.append(y_val_pred)
-
-    cv_records.append({
-        "fold": fold_idx,
-        "repeat": 1,
-        "sp_max": sp_f,
-        "pd_knee": pd_f,
-        "fa_knee": fa_f,
-        "threshold_knee": thresh_f,
-        "auc": auc_f,
-        "best_epoch": sp_cb_f.best_epoch + 1,
-        "model_path": os.path.basename(fold_model_path),
-    })
-
-    training_results_metadata.append({
-        "fold": fold_idx,
-        "repeat": 1,
-        "max_sp": sp_f,
-        "pd_knee": pd_f,
-        "fa_knee": fa_f,
-        "threshold_knee": thresh_f,
-        "auc": auc_f,
-        "best_epoch": sp_cb_f.best_epoch + 1,
-        "keras_history": hist_f.history,
-    })
-
+    fold_refs[fold_idx] = {
+        "fp32": {"model": fp32_f, "eval": evaluate_model(fp32_f, X_val_f, y_val_f, X_holdout, y_holdout)},
+        "u8": {"model": u8_f, "eval": evaluate_model(u8_f, X_val_f, y_val_f, X_holdout, y_holdout)},
+    }
     print(
-        f"  [Fold {fold_idx}/{N_SPLITS}] SP = {sp_f*100:.2f}% | PD = {pd_f*100:.2f}% "
-        f"| FA = {fa_f*100:.2f}% | AUC = {auc_f:.4f} | Salvo: {os.path.basename(fold_model_path)}"
+        f"  [Fold {fold_idx}] SP_val FP32 = {fold_refs[fold_idx]['fp32']['eval']['sp_val']*100:.2f}% | "
+        f"8 bits = {fold_refs[fold_idx]['u8']['eval']['sp_val']*100:.2f}%"
     )
 
-    if sp_f > best_overall_sp:
-        best_overall_sp = sp_f
-        best_fold_idx = fold_idx
-        best_qmodel = qmodel_f
-        best_history_dict = hist_f.history
 
+def cross_validate(w_bits):
+    runs = []
+    for fold_idx, (tr_idx, val_idx) in enumerate(fold_splits, start=1):
+        X_tr_f, y_tr_f, X_val_f, y_val_f = X_dev[tr_idx], y_dev[tr_idx], X_dev[val_idx], y_dev[val_idx]
+        q_f, cb_f, hist_f = train_qat(
+            ARCH, w_bits, ACT_BITS, INPUT_BITS, fold_refs[fold_idx]["fp32"]["model"],
+            X_tr_f, y_tr_f, X_val_f, y_val_f, epochs=EPOCHS_CV, seed=SEED + fold_idx,
+        )
+        runs.append({
+            "fold": fold_idx, "model": q_f, "best_epoch": cb_f.best_epoch + 1, "history": hist_f,
+            "y_val": y_val_f, "eval": evaluate_model(q_f, X_val_f, y_val_f, X_holdout, y_holdout),
+        })
+    return runs
+
+
+def sp_list(source, key="sp_val"):
+    return [run["eval"][key] for run in source]
+
+
+u8_runs = [{"fold": k, "eval": fold_refs[k]["u8"]["eval"]} for k in fold_refs]
+fp32_runs = [{"fold": k, "eval": fold_refs[k]["fp32"]["eval"]} for k in fold_refs]
+
+# Candidatos aceitos no laço, do mais barato ao mais caro
+cv_candidates = []
+for cand in sorted(accepted, key=lambda c: c["resources"]["LUT"]):
+    if cand["w_bits"] not in [c["w_bits"] for c in cv_candidates]:
+        cv_candidates.append(cand)
+
+kkt_runs, cv_decision = None, None
+for cand in cv_candidates:
+    runs = cross_validate(cand["w_bits"])
+    diff_u8 = paired_difference(sp_list(runs), sp_list(u8_runs))
+    passed = diff_u8["mean"] >= -SP_TOLERANCE
+    print(
+        f"[CV] w={list(cand['w_bits'].values())}b: SP_val = {np.mean(sp_list(runs))*100:.2f}% | "
+        f"Δ vs 8 bits (pareado) = {diff_u8['mean']*100:+.2f} ± {diff_u8['std']*100:.2f} p.p. "
+        f"(erro padrão {diff_u8['se']*100:.2f}) -> {'confirmado' if passed else 'reprovado'}"
+    )
+    if passed:
+        kkt_runs, chosen_cand = runs, cand
+        cv_decision = {"w_bits": cand["w_bits"], "paired_diff_vs_u8": diff_u8}
+        break
+
+if kkt_runs is None:
+    print("Nenhuma alocação mista manteve o SP em CV pareada: fica o 8 bits uniforme.")
+    kkt_runs = [{"fold": k, "model": fold_refs[k]["u8"]["model"], "best_epoch": None, "history": {},
+                 "y_val": y_dev[fold_splits[k - 1][1]], "eval": fold_refs[k]["u8"]["eval"]} for k in fold_refs]
+    chosen_cand = evaluated[tuple(w_8bit[n] for n in layer_names)]
+    cv_decision = {"w_bits": w_8bit, "paired_diff_vs_u8": paired_difference(sp_list(kkt_runs), sp_list(u8_runs))}
+
+kkt_weights_bits = dict(chosen_cand["w_bits"])
+diff_kkt_u8 = paired_difference(sp_list(kkt_runs), sp_list(u8_runs))
+diff_kkt_fp32 = paired_difference(sp_list(kkt_runs), sp_list(fp32_runs))
+diff_ho_kkt_u8 = paired_difference(sp_list(kkt_runs, "sp_test"), sp_list(u8_runs, "sp_test"))
+
+paired_df = pd.DataFrame([
+    {
+        "fold": k,
+        "sp_val_fp32": fold_refs[k]["fp32"]["eval"]["sp_val"],
+        "sp_val_u8": fold_refs[k]["u8"]["eval"]["sp_val"],
+        "sp_val_kkt": run["eval"]["sp_val"],
+        "diff_val_kkt_u8": run["eval"]["sp_val"] - fold_refs[k]["u8"]["eval"]["sp_val"],
+        "diff_val_kkt_fp32": run["eval"]["sp_val"] - fold_refs[k]["fp32"]["eval"]["sp_val"],
+        "sp_holdout_fp32": fold_refs[k]["fp32"]["eval"]["sp_test"],
+        "sp_holdout_u8": fold_refs[k]["u8"]["eval"]["sp_test"],
+        "sp_holdout_kkt": run["eval"]["sp_test"],
+    }
+    for k, run in zip(fold_refs, kkt_runs)
+])
+paired_df.to_csv(os.path.join(exporter.metadata_dir, "paired_cv_comparison.csv"), index=False)
+display((paired_df.set_index("fold") * 100).round(3))
+
+print(f"\nAlocação confirmada: w={list(kkt_weights_bits.values())}b, a={list(ACT_BITS.values())}b, entrada {INPUT_BITS}b")
+print(f"  SP_val (CV)          : FP32 {np.mean(sp_list(fp32_runs))*100:.2f}% | 8 bits {np.mean(sp_list(u8_runs))*100:.2f}% | KKT {np.mean(sp_list(kkt_runs))*100:.2f}% ± {np.std(sp_list(kkt_runs), ddof=1)*100:.2f}%")
+print(f"  Δ pareado (validação): KKT − 8 bits = {diff_kkt_u8['mean']*100:+.2f} ± {diff_kkt_u8['std']*100:.2f} p.p. (erro padrão {diff_kkt_u8['se']*100:.2f}) | KKT − FP32 = {diff_kkt_fp32['mean']*100:+.2f} ± {diff_kkt_fp32['std']*100:.2f} p.p.")
+print(f"  Holdout (limiar da validação, média dos folds): FP32 {np.mean(sp_list(fp32_runs, 'sp_test'))*100:.2f}% | 8 bits {np.mean(sp_list(u8_runs, 'sp_test'))*100:.2f}% | KKT {np.mean(sp_list(kkt_runs, 'sp_test'))*100:.2f}% (Δ KKT − 8 bits = {diff_ho_kkt_u8['mean']*100:+.2f} p.p.)")
+
+# Artefatos por fold da alocação confirmada
+training_results_metadata, cv_records, folds_y_true, folds_y_pred = [], [], [], []
+for run in kkt_runs:
+    ev = run["eval"]
+    fold_model_path = exporter.save_fold_model(run["model"], fold=run["fold"], repeat=1)
+    folds_y_true.append(run["y_val"])
+    folds_y_pred.append(ev["y_pred_val"])
+    record = {
+        "fold": run["fold"],
+        "repeat": 1,
+        "sp_max": ev["sp_val"],
+        "pd_knee": ev["pd_val"],
+        "fa_knee": ev["fa_val"],
+        "threshold_knee": ev["threshold"],
+        "auc": ev["auc_val"],
+        "best_epoch": run["best_epoch"],
+        "model_path": os.path.basename(fold_model_path),
+        "sp_holdout_val_threshold": ev["sp_test"],
+        "pd_holdout_val_threshold": ev["pd_test"],
+        "fa_holdout_val_threshold": ev["fa_test"],
+    }
+    cv_records.append(record)
+    training_results_metadata.append({**{k: v for k, v in record.items() if k != "model_path"},
+                                      "max_sp": ev["sp_val"], "keras_history": run["history"]})
 cv_df = pd.DataFrame(cv_records)
-print(f"\nMelhor Fold: #{best_fold_idx} com SP = {best_overall_sp*100:.2f}%")
-print(
-    f"Média CV ({N_SPLITS} Folds): SP = {cv_df['sp_max'].mean()*100:.2f}% ± {cv_df['sp_max'].std()*100:.2f}% | "
-    f"PD = {cv_df['pd_knee'].mean()*100:.2f}% | FA = {cv_df['fa_knee'].mean()*100:.2f}%"
-)
 
-# Avaliação Final no Holdout Isolado
-y_pred_holdout = best_qmodel.predict(X_holdout, batch_size=2048, verbose=0).ravel()
-sp_ho, pd_ho, fa_ho, thresh_ho, _ = compute_sp_with_threshold(y_holdout, y_pred_holdout)
+# Modelo exportado: o fold de maior SP de validação; as métricas relatadas são as médias acima
+best_run = max(kkt_runs, key=lambda run: run["eval"]["sp_val"])
+best_fold_idx = best_run["fold"]
+best_qmodel = best_run["model"]
+best_history_dict = best_run["history"]
+best_eval = best_run["eval"]
+fp32_best_eval = fold_refs[best_fold_idx]["fp32"]["eval"]
+y_pred_holdout, thresh_ho = best_eval["y_pred_test"], best_eval["threshold"]
+sp_ho, pd_ho, fa_ho = best_eval["sp_test"], best_eval["pd_test"], best_eval["fa_test"]
+y_pred_fp32_holdout = fp32_best_eval["y_pred_test"]
+sp_fp32_ho, pd_fp32_ho, fa_fp32_ho = fp32_best_eval["sp_test"], fp32_best_eval["pd_test"], fp32_best_eval["fa_test"]
+
 hw_qkeras_kkt = compute_model_hardware_costs(
-    best_qmodel, weights_bits=kkt_weights_bits, act_bits=kkt_act_bits, input_dim=input_dim, input_bits=INPUT_BITS
+    best_qmodel, weights_bits=kkt_weights_bits, act_bits=ACT_BITS, input_dim=input_dim, input_bits=INPUT_BITS
 )
+hw_u8 = compute_model_hardware_costs(
+    fold_refs[best_fold_idx]["u8"]["model"], weights_bits=w_8bit, act_bits=ACT_BITS,
+    input_dim=input_dim, input_bits=INPUT_BITS,
+)
+print(f"\n[Modelo exportado: fold #{best_fold_idx}] holdout no limiar da validação: SP = {sp_ho*100:.2f}% | PD = {pd_ho*100:.2f}% | FA = {fa_ho*100:.2f}% | limiar = {thresh_ho:.4f}")
+print(f"  • Recursos VU13P: {', '.join(f'{k} = {v:,.0f}' for k, v in hw_qkeras_kkt['vu13p_resources'].items())}")
 
-print(f"\n[Holdout Test Set - Melhor Modelo QKeras KKT (Fold #{best_fold_idx})]")
-print(f"  • SP = {sp_ho*100:.2f}% | PD = {pd_ho*100:.2f}% | FA = {fa_ho*100:.2f}% | Limiar = {thresh_ho:.4f}")
-print(f"  • Hardware: {hw_qkeras_kkt['total_bops']:,} BOPs | {hw_qkeras_kkt['total_macs']:,} MACs | {hw_qkeras_kkt['total_params']} Parâmetros")
-print(f"  • Recursos VU13P: {hw_qkeras_kkt['vu13p_resources']}")
+kkt_result["integer_bits"] = kkt_weights_bits
+kkt_result["cv_confirmation"] = {
+    **cv_decision,
+    "paired_diff_vs_fp32": diff_kkt_fp32,
+    "paired_diff_holdout_vs_u8": diff_ho_kkt_u8,
+    "candidates_tested": [c["w_bits"] for c in cv_candidates[: cv_candidates.index(chosen_cand) + 1]] if chosen_cand in cv_candidates else [],
+}
+
+def mean_eval(runs, key):
+    return float(np.mean(sp_list(runs, key)))
 
 # Exportação Hierárquica Jubiaba
 exporter.save_best_model(best_qmodel, input_dim=input_dim)
@@ -584,16 +610,22 @@ exporter.save_metadata(
         "vu13p_chip_limits": VU13P_LIMITS,
         "vu13p_instance_budget": VU13P_INSTANCE_BUDGET,
         "hardware_fp32": hw_fp32,
+        "hardware_uniform_8bit": hw_u8,
         "hardware_qkeras_kkt": hw_qkeras_kkt,
         "holdout_metrics": {
-            "sp": sp_ho,
-            "pd": pd_ho,
-            "fa": fa_ho,
+            "aggregation": "mean over the CV fold models, each at the threshold chosen on its validation fold",
+            "sp": mean_eval(kkt_runs, "sp_test"),
+            "pd": mean_eval(kkt_runs, "pd_test"),
+            "fa": mean_eval(kkt_runs, "fa_test"),
             "threshold": thresh_ho,
-            "fp32_sp": sp_fp32_ho,
-            "fp32_pd": pd_fp32_ho,
-            "fp32_fa": fa_fp32_ho,
+            "fp32_sp": mean_eval(fp32_runs, "sp_test"),
+            "fp32_pd": mean_eval(fp32_runs, "pd_test"),
+            "fp32_fa": mean_eval(fp32_runs, "fa_test"),
+            "u8_sp": mean_eval(u8_runs, "sp_test"),
+            "u8_pd": mean_eval(u8_runs, "pd_test"),
+            "u8_fa": mean_eval(u8_runs, "fa_test"),
         },
+        "paired_cv": paired_df.to_dict(orient="records"),
     },
     seed=SEED,
     folds_y_true=folds_y_true,
@@ -604,12 +636,12 @@ exporter.save_metadata(
 # Cell 5: Section 4 - Diagnostic & Physics Visualizations
 cells.append(nbf.v4.new_markdown_cell(r"""## 4. Diagnóstico Visual de Recursos na VU13P e Desempenho Físico (`codeTCC` + `Jubiaba`)
 
-Geramos os gráficos de utilização de recursos na FPGA Virtex UltraScale+ VU13P, curvas de aprendizado, curvas ROC (melhor modelo, duelo FP32 vs. KKT e envoltória dos 5 folds), distribuição de scores, matriz de confusão no joelho $SP$ e boxplots de estabilidade.
+Geramos os gráficos de utilização de recursos na FPGA Virtex UltraScale+ VU13P (8 bits uniforme e alocação escolhida, ambos com pesos treinados), curvas de aprendizado, curvas ROC (modelo exportado, duelo FP32 vs. KKT do mesmo fold e envoltória dos 5 folds), distribuição de scores, matriz de confusão e boxplots de estabilidade. Os gráficos de holdout usam o limiar escolhido na validação.
 """))
 
 cells.append(nbf.v4.new_code_cell(r"""# 3. Ocupação de Recursos na FPGA Virtex UltraScale+ VU13P e Alocação de Bits por Camada
 plot_vu13p_resource_utilization(
-    hw_8bit=hw_fp32,
+    hw_8bit=hw_u8,
     hw_kkt=hw_qkeras_kkt,
     vu13p_budget=VU13P_INSTANCE_BUDGET,
     save_path=exporter.get_plot_path("vu13p_resource_utilization.png"),
@@ -633,7 +665,7 @@ plot_best_model_roc(
     pd_knee=pd_ho,
     fa_knee=fa_ho,
     save_path=exporter.get_plot_path("roc_best_model.png"),
-    title=f"Curva ROC Holdout - QCNN1D KKT v{VERSION} ({input_dim} Anéis)",
+    title=f"Curva ROC Holdout (fold #{best_fold_idx}, limiar da validação) - QCNN1D KKT v{VERSION}",
     show=True,
 )
 
@@ -727,37 +759,38 @@ df_layer_quant = pd.DataFrame(layer_quant_rows)
 print("=== Tabela de Quantização Final por Camada e Consumo na FPGA VU13P ===")
 display(df_layer_quant)
 
-res_fp32_8b = hw_fp32["vu13p_resources"]
+res_u8 = hw_u8["vu13p_resources"]
 res_kkt = hw_qkeras_kkt["vu13p_resources"]
 
+
+def summary_row(name, precision, runs, diff, hw):
+    sp_val = sp_list(runs)
+    sp_ho_list = sp_list(runs, "sp_test")
+    res = hw["vu13p_resources"] if hw else None
+    return {
+        "Modelo": name,
+        "Precisão (w_l / a_l)": precision,
+        "SP CV val [%]": f"{np.mean(sp_val)*100:.2f} ± {np.std(sp_val, ddof=1)*100:.2f}",
+        "SP Holdout [%]": f"{np.mean(sp_ho_list)*100:.2f} ± {np.std(sp_ho_list, ddof=1)*100:.2f}",
+        "Δ SP vs 8 bits [p.p.]": "—" if diff is None else f"{diff['mean']*100:+.2f} ± {diff['se']*100:.2f}",
+        "BOPs": "—" if hw is None else f"{hw['total_bops']:,}",
+        "VU13P DSPs": "—" if res is None else int(res["DSP"]),
+        "VU13P LUTs": "—" if res is None else f"{res['LUT']:,.0f}",
+        "VU13P FFs": "—" if res is None else f"{res['FF']:,.0f}",
+    }
+
+
 summary_df = pd.DataFrame([
-    {
-        "Topologia": f"v{VERSION} ({input_dim} Anéis)",
-        "Modelo": "Referência (Equiv. 8-bit Uniforme)",
-        "Precisão (w_l / a_l)": "w: [8, 8, 8]b | a: [8, 8]b",
-        "SP Holdout [%]": f"{sp_fp32_ho*100:.2f}%",
-        "PD Holdout [%]": f"{pd_fp32_ho*100:.2f}%",
-        "FA Holdout [%]": f"{fa_fp32_ho*100:.2f}%",
-        "BOPs": f"{hw_fp32['total_bops']:,}",
-        "VU13P DSPs": int(res_fp32_8b["DSP"]),
-        "VU13P LUTs": f"{res_fp32_8b['LUT']:,.0f}",
-        "VU13P FFs": f"{res_fp32_8b['FF']:,.0f}",
-        "VU13P BRAM [bits]": f"{res_fp32_8b['BRAM_bits']:,.0f}",
-    },
-    {
-        "Topologia": f"v{VERSION} ({input_dim} Anéis)",
-        "Modelo": "QCNN1D KKT Primal-Dual (Melhor Fold)",
-        "Precisão (w_l / a_l)": f"w: [{kkt_weights_bits['conv1d_1']}, {kkt_weights_bits['dense_1']}, {kkt_weights_bits['output_dense']}]b | a: [{kkt_act_bits['conv1d_1']}, {kkt_act_bits['dense_1']}]b",
-        "SP Holdout [%]": f"{sp_ho*100:.2f}%",
-        "PD Holdout [%]": f"{pd_ho*100:.2f}%",
-        "FA Holdout [%]": f"{fa_ho*100:.2f}%",
-        "BOPs": f"{hw_qkeras_kkt['total_bops']:,}",
-        "VU13P DSPs": int(res_kkt["DSP"]),
-        "VU13P LUTs": f"{res_kkt['LUT']:,.0f}",
-        "VU13P FFs": f"{res_kkt['FF']:,.0f}",
-        "VU13P BRAM [bits]": f"{res_kkt['BRAM_bits']:,.0f}",
-    },
+    summary_row("FP32 (referência)", "ponto flutuante", fp32_runs,
+                paired_difference(sp_list(fp32_runs), sp_list(u8_runs)), None),
+    summary_row("8 bits uniforme", "w: [8, 8, 8]b | a: [8, 8]b", u8_runs, None, hw_u8),
+    summary_row(
+        "Alocação Lagrange/KKT",
+        f"w: {list(kkt_weights_bits.values())}b | a: {list(ACT_BITS.values())}b",
+        kkt_runs, diff_kkt_u8, hw_qkeras_kkt,
+    ),
 ])
+print("SP: média ± desvio dos 5 folds; holdout no limiar escolhido na validação; Δ pareado ± erro padrão.")
 print("\n=== Comparativo Global de Desempenho Físico e Recursos na VU13P ===")
 display(summary_df)
 

@@ -126,6 +126,22 @@ def compute_sp_with_threshold(
     )
 
 
+def sp_at_threshold(
+    y_true: np.ndarray, y_pred: np.ndarray, threshold: float
+) -> Tuple[float, float, float]:
+    """SP, PD and FA at a decision threshold fixed beforehand (e.g. the knee found on validation).
+
+    Choosing the knee on the evaluated set itself is optimistic; a test set must be scored at a
+    threshold that did not look at it.
+    """
+    y_true = np.asarray(y_true).ravel()
+    accept = np.asarray(y_pred).ravel() >= threshold
+    pd_ = float(np.mean(accept[y_true == 1]))
+    fa = float(np.mean(accept[y_true == 0]))
+    sp = float(np.sqrt(np.sqrt(pd_ * (1.0 - fa)) * 0.5 * (pd_ + (1.0 - fa))))
+    return sp, pd_, fa
+
+
 class SPCallback(Callback):
     """Keras Callback for monitoring SP index and saving best model weights."""
 

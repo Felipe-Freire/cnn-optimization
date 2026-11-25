@@ -1,13 +1,13 @@
 {
   "continuous_bits": {
-    "conv1d_1": 4.041040906550763,
-    "dense_1": 4.843897595958012,
-    "output_dense": 5.369954003140568
+    "conv1d_1": 3.213049232657699,
+    "dense_1": 3.4072208350957895,
+    "output_dense": 3.0886777983267444
   },
   "integer_bits": {
     "conv1d_1": 5,
-    "dense_1": 5,
-    "output_dense": 5
+    "dense_1": 4,
+    "output_dense": 3
   },
   "activation_bits": {
     "conv1d_1": 8,
@@ -20,28 +20,28 @@
   },
   "shadow_prices": {
     "DSP": 0.0,
-    "LUT": 0.18141061859101543,
+    "LUT": 0.2745278131165726,
     "FF": 0.0,
     "BRAM_bits": 0.0
   },
   "g_continuous": {
     "DSP": -1.0,
-    "LUT": 3.964814898615998e-08,
-    "FF": -0.8094830261091931,
+    "LUT": 1.2328665333072308e-07,
+    "FF": -0.8840429494449362,
     "BRAM_bits": -0.9813988095238095
   },
-  "stationarity_residual": 1.0408340855860843e-17,
-  "complementary_slackness": 7.1925952335680235e-09,
+  "stationarity_residual": 6.938893903907228e-18,
+  "complementary_slackness": 3.384561532534442e-08,
   "dual_iterations": 4,
   "dual_converged": true,
-  "dual_bound": 0.031088775235065706,
-  "omega_continuous": 0.03108876804247047,
-  "omega_integer": 0.017682092128022003,
-  "duality_gap": -0.013406683107043703,
+  "dual_bound": 0.06535824409644296,
+  "omega_continuous": 0.06535821025082764,
+  "omega_integer": 0.019003391805502666,
+  "duality_gap": -0.046354852290940295,
   "integer_resources": {
     "DSP": 0.0,
-    "LUT": 14201.8544633463,
-    "FF": 5284.870869638103,
+    "LUT": 8952.60764836411,
+    "FF": 3103.1034715851974,
     "BRAM_bits": 18432.0
   },
   "input_bits": 8,
@@ -53,22 +53,22 @@
   },
   "selection": {
     "sp_tolerance": 0.001,
-    "sp_target": 0.978226122280582,
+    "sp_target": 0.9772701680783149,
     "reference_8bit": {
       "w_bits": {
         "conv1d_1": 8,
         "dense_1": 8,
         "output_dense": 8
       },
-      "sp_val": 0.979226122280582,
+      "sp_val": 0.9782701680783149,
       "resources": {
         "DSP": 0.0,
-        "LUT": 26406.451554797237,
-        "FF": 10064.5084106509,
+        "LUT": 23279.163045107834,
+        "FF": 8762.393045520561,
         "BRAM_bits": 18432.0
       }
     },
-    "chosen_budget_lut": 14239.450509725993,
+    "chosen_budget_lut": 8963.715174405823,
     "chosen_iteration": 6,
     "candidates": [
       {
@@ -77,11 +77,11 @@
           "dense_1": 8,
           "output_dense": 8
         },
-        "sp_val": 0.979226122280582,
+        "sp_val": 0.9782701680783149,
         "resources": {
           "DSP": 0.0,
-          "LUT": 26406.451554797237,
-          "FF": 10064.5084106509,
+          "LUT": 23279.163045107834,
+          "FF": 8762.393045520561,
           "BRAM_bits": 18432.0
         }
       },
@@ -91,39 +91,11 @@
           "dense_1": 4,
           "output_dense": 8
         },
-        "sp_val": 0.9767088827082788,
+        "sp_val": 0.9770358257473396,
         "resources": {
           "DSP": 0.0,
-          "LUT": 9432.53230866908,
-          "FF": 3399.730319896294,
-          "BRAM_bits": 18432.0
-        }
-      },
-      {
-        "w_bits": {
-          "conv1d_1": 4,
-          "dense_1": 5,
-          "output_dense": 8
-        },
-        "sp_val": 0.9768608109408294,
-        "resources": {
-          "DSP": 0.0,
-          "LUT": 11627.155843047001,
-          "FF": 4309.638119438825,
-          "BRAM_bits": 18432.0
-        }
-      },
-      {
-        "w_bits": {
-          "conv1d_1": 4,
-          "dense_1": 6,
-          "output_dense": 8
-        },
-        "sp_val": 0.9765377234366915,
-        "resources": {
-          "DSP": 0.0,
-          "LUT": 13900.844101116985,
-          "FF": 5252.466255957058,
+          "LUT": 7304.390698900249,
+          "FF": 2513.6317457904993,
           "BRAM_bits": 18432.0
         }
       },
@@ -133,25 +105,53 @@
           "dense_1": 5,
           "output_dense": 8
         },
-        "sp_val": 0.9786509447270011,
+        "sp_val": 0.9785059119677775,
         "resources": {
           "DSP": 0.0,
-          "LUT": 13672.96719938008,
-          "FF": 5064.65702281891,
+          "LUT": 11520.259787733035,
+          "FF": 4168.329936702388,
+          "BRAM_bits": 18432.0
+        }
+      },
+      {
+        "w_bits": {
+          "conv1d_1": 4,
+          "dense_1": 5,
+          "output_dense": 8
+        },
+        "sp_val": 0.9776644886996498,
+        "resources": {
+          "DSP": 0.0,
+          "LUT": 9502.523633546485,
+          "FF": 3425.0007613345624,
           "BRAM_bits": 18432.0
         }
       },
       {
         "w_bits": {
           "conv1d_1": 5,
-          "dense_1": 5,
-          "output_dense": 5
+          "dense_1": 4,
+          "output_dense": 8
         },
-        "sp_val": 0.9785684094905438,
+        "sp_val": 0.9781739012746349,
         "resources": {
           "DSP": 0.0,
-          "LUT": 13576.149039036538,
-          "FF": 5024.344651953103,
+          "LUT": 9374.767857111541,
+          "FF": 3278.879161181313,
+          "BRAM_bits": 18432.0
+        }
+      },
+      {
+        "w_bits": {
+          "conv1d_1": 5,
+          "dense_1": 4,
+          "output_dense": 3
+        },
+        "sp_val": 0.9780932864462579,
+        "resources": {
+          "DSP": 0.0,
+          "LUT": 9267.215060653149,
+          "FF": 3234.0971884284636,
           "BRAM_bits": 18432.0
         }
       }
@@ -160,9 +160,9 @@
   "primal_dual_history": [
     {
       "iteration": 1,
-      "sp_val": 0.9767088827082788,
-      "sp_loss": 0.023291117291721175,
-      "lagrangian_cost": 0.020958883890630123,
+      "sp_val": 0.9770358257473396,
+      "sp_loss": 0.022964174252660396,
+      "lagrangian_cost": -0.02658489514077441,
       "w_bits": {
         "conv1d_1": 4,
         "dense_1": 4,
@@ -174,25 +174,25 @@
       },
       "resources": {
         "DSP": 0.0,
-        "LUT": 9432.53230866908,
-        "FF": 3399.730319896294,
+        "LUT": 7304.390698900249,
+        "FF": 2513.6317457904993,
         "BRAM_bits": 18432.0
       },
       "g_raw": {
         "DSP": -102.4,
-        "LUT": -25.804833774469444,
-        "FF": -24912.478690876804,
+        "LUT": -1504.9338345099704,
+        "FF": -25798.5772649826,
         "BRAM_bits": -972472.3200000001
       },
       "g_val": {
         "DSP": -1.0,
-        "LUT": -0.0027282632650798906,
-        "FF": -0.8799199907501862,
+        "LUT": -0.17083419152085527,
+        "FF": -0.9112173922976468,
         "BRAM_bits": -0.9813988095238095
       },
       "mu": {
         "DSP": 0.0,
-        "LUT": 0.8548417709325277,
+        "LUT": 0.2900418759987277,
         "FF": 0.0,
         "BRAM_bits": 0.0
       },
@@ -201,13 +201,13 @@
         "sp_converged": false,
         "sp_change": 1.0,
         "stationary": true,
-        "stationarity_residual": 5.551115123125783e-17,
+        "stationarity_residual": 1.3877787807814457e-17,
         "primal_feasible": true,
         "dual_feasible": true,
-        "complementary_slackness": true,
+        "complementary_slackness": false,
         "slackness_products": {
           "DSP": 0.0,
-          "LUT": 0.002332233401091054,
+          "LUT": 0.04954906939343481,
           "FF": 0.0,
           "BRAM_bits": 0.0
         }
@@ -215,11 +215,11 @@
     },
     {
       "iteration": 2,
-      "sp_val": 0.9768608109408294,
-      "sp_loss": 0.023139189059170562,
-      "lagrangian_cost": 0.00984099981456924,
+      "sp_val": 0.9785059119677775,
+      "sp_loss": 0.021494088032222525,
+      "lagrangian_cost": 0.020510554226560274,
       "w_bits": {
-        "conv1d_1": 4,
+        "conv1d_1": 5,
         "dense_1": 5,
         "output_dense": 8
       },
@@ -229,25 +229,25 @@
       },
       "resources": {
         "DSP": 0.0,
-        "LUT": 11627.155843047001,
-        "FF": 4309.638119438825,
+        "LUT": 11520.259787733035,
+        "FF": 4168.329936702388,
         "BRAM_bits": 18432.0
       },
       "g_raw": {
         "DSP": -102.4,
-        "LUT": -426.13726898889945,
-        "FF": -24002.570891334275,
+        "LUT": -112.14824054831297,
+        "FF": -24143.87907407071,
         "BRAM_bits": -972472.3200000001
       },
       "g_val": {
         "DSP": -1.0,
-        "LUT": -0.03535442679672139,
-        "FF": -0.8477816366148272,
+        "LUT": -0.009641016741817516,
+        "FF": -0.8527727054036549,
         "BRAM_bits": -0.9813988095238095
       },
       "mu": {
         "DSP": 0.0,
-        "LUT": 0.3761392970974298,
+        "LUT": 0.10201556868957734,
         "FF": 0.0,
         "BRAM_bits": 0.0
       },
@@ -256,13 +256,13 @@
         "sp_converged": false,
         "sp_change": 1.0,
         "stationary": true,
-        "stationarity_residual": 1.3877787807814457e-17,
+        "stationarity_residual": 1.734723475976807e-18,
         "primal_feasible": true,
         "dual_feasible": true,
         "complementary_slackness": true,
         "slackness_products": {
           "DSP": 0.0,
-          "LUT": 0.013298189244601322,
+          "LUT": 0.00098353380566225,
           "FF": 0.0,
           "BRAM_bits": 0.0
         }
@@ -270,12 +270,12 @@
     },
     {
       "iteration": 3,
-      "sp_val": 0.9765377234366915,
-      "sp_loss": 0.02346227656330846,
-      "lagrangian_cost": 0.028319918489191426,
+      "sp_val": 0.9776644886996498,
+      "sp_loss": 0.022335511300350164,
+      "lagrangian_cost": 0.011298201272159948,
       "w_bits": {
         "conv1d_1": 4,
-        "dense_1": 6,
+        "dense_1": 5,
         "output_dense": 8
       },
       "a_bits": {
@@ -284,40 +284,40 @@
       },
       "resources": {
         "DSP": 0.0,
-        "LUT": 13900.844101116985,
-        "FF": 5252.466255957058,
+        "LUT": 9502.523633546485,
+        "FF": 3425.0007613345624,
         "BRAM_bits": 18432.0
       },
       "g_raw": {
         "DSP": -102.4,
-        "LUT": 294.19510655123304,
-        "FF": -23059.74275481604,
+        "LUT": -620.4036815228501,
+        "FF": -24887.208249438536,
         "BRAM_bits": -972472.3200000001
       },
       "g_val": {
         "DSP": -1.0,
-        "LUT": 0.02162142248754482,
-        "FF": -0.8144805213200271,
+        "LUT": -0.061286983716587196,
+        "FF": -0.879027427353644,
         "BRAM_bits": -0.9813988095238095
       },
       "mu": {
         "DSP": 0.0,
-        "LUT": 0.2246680082534462,
+        "LUT": 0.180092237517034,
         "FF": 0.0,
         "BRAM_bits": 0.0
       },
       "kkt_diagnostics": {
-        "converged": false,
+        "converged": true,
         "sp_converged": true,
-        "sp_change": 0.00024712338786259114,
+        "sp_change": 0.00010638015790875865,
         "stationary": true,
         "stationarity_residual": 6.938893903907228e-18,
-        "primal_feasible": false,
+        "primal_feasible": true,
         "dual_feasible": true,
         "complementary_slackness": true,
         "slackness_products": {
           "DSP": 0.0,
-          "LUT": 0.004857641925882967,
+          "LUT": 0.011037310028190216,
           "FF": 0.0,
           "BRAM_bits": 0.0
         }
@@ -325,12 +325,12 @@
     },
     {
       "iteration": 4,
-      "sp_val": 0.9786509447270011,
-      "sp_loss": 0.021349055272998907,
-      "lagrangian_cost": 0.012213547304775392,
+      "sp_val": 0.9781739012746349,
+      "sp_loss": 0.021826098725365117,
+      "lagrangian_cost": 0.02014934204103653,
       "w_bits": {
         "conv1d_1": 5,
-        "dense_1": 5,
+        "dense_1": 4,
         "output_dense": 8
       },
       "a_bits": {
@@ -339,142 +339,32 @@
       },
       "resources": {
         "DSP": 0.0,
-        "LUT": 13672.96719938008,
-        "FF": 5064.65702281891,
+        "LUT": 9374.767857111541,
+        "FF": 3278.879161181313,
         "BRAM_bits": 18432.0
       },
       "g_raw": {
         "DSP": -102.4,
-        "LUT": -783.8907412820226,
-        "FF": -23247.55198795419,
+        "LUT": -68.54469445471295,
+        "FF": -25033.329849591784,
         "BRAM_bits": -972472.3200000001
       },
       "g_val": {
         "DSP": -1.0,
-        "LUT": -0.054222760194468755,
-        "FF": -0.8211140281956892,
+        "LUT": -0.007258543448648666,
+        "FF": -0.8841885082180035,
         "BRAM_bits": -0.9813988095238095
       },
       "mu": {
         "DSP": 0.0,
-        "LUT": 0.1684810573172449,
-        "FF": 0.0,
-        "BRAM_bits": 0.0
-      },
-      "kkt_diagnostics": {
-        "converged": false,
-        "sp_converged": false,
-        "sp_change": 0.0019516775382406593,
-        "stationary": true,
-        "stationarity_residual": 6.938893903907228e-18,
-        "primal_feasible": true,
-        "dual_feasible": true,
-        "complementary_slackness": true,
-        "slackness_products": {
-          "DSP": 0.0,
-          "LUT": 0.009135507968223515,
-          "FF": 0.0,
-          "BRAM_bits": 0.0
-        }
-      }
-    },
-    {
-      "iteration": 5,
-      "sp_val": 0.9765377234366915,
-      "sp_loss": 0.02346227656330846,
-      "lagrangian_cost": 0.021731108944255367,
-      "w_bits": {
-        "conv1d_1": 4,
-        "dense_1": 6,
-        "output_dense": 8
-      },
-      "a_bits": {
-        "conv1d_1": 8,
-        "dense_1": 8
-      },
-      "resources": {
-        "DSP": 0.0,
-        "LUT": 13900.844101116985,
-        "FF": 5252.466255957058,
-        "BRAM_bits": 18432.0
-      },
-      "g_raw": {
-        "DSP": -102.4,
-        "LUT": -124.46842883720092,
-        "FF": -23059.74275481604,
-        "BRAM_bits": -972472.3200000001
-      },
-      "g_val": {
-        "DSP": -1.0,
-        "LUT": -0.00887455652566535,
-        "FF": -0.8144805213200271,
-        "BRAM_bits": -0.9813988095238095
-      },
-      "mu": {
-        "DSP": 0.0,
-        "LUT": 0.19507088766030506,
-        "FF": 0.0,
-        "BRAM_bits": 0.0
-      },
-      "kkt_diagnostics": {
-        "converged": false,
-        "sp_converged": false,
-        "sp_change": 0.0010566106451547208,
-        "stationary": true,
-        "stationarity_residual": 1.3877787807814457e-17,
-        "primal_feasible": true,
-        "dual_feasible": true,
-        "complementary_slackness": true,
-        "slackness_products": {
-          "DSP": 0.0,
-          "LUT": 0.0017311676190530927,
-          "FF": 0.0,
-          "BRAM_bits": 0.0
-        }
-      }
-    },
-    {
-      "iteration": 6,
-      "sp_val": 0.9785684094905438,
-      "sp_loss": 0.0214315905094562,
-      "lagrangian_cost": 0.012981128883291955,
-      "w_bits": {
-        "conv1d_1": 5,
-        "dense_1": 5,
-        "output_dense": 5
-      },
-      "a_bits": {
-        "conv1d_1": 8,
-        "dense_1": 8
-      },
-      "resources": {
-        "DSP": 0.0,
-        "LUT": 13576.149039036538,
-        "FF": 5024.344651953103,
-        "BRAM_bits": 18432.0
-      },
-      "g_raw": {
-        "DSP": -102.4,
-        "LUT": -663.3014706894555,
-        "FF": -23287.864358819996,
-        "BRAM_bits": -972472.3200000001
-      },
-      "g_val": {
-        "DSP": -1.0,
-        "LUT": -0.04658195695377428,
-        "FF": -0.8225378793282684,
-        "BRAM_bits": -0.9813988095238095
-      },
-      "mu": {
-        "DSP": 0.0,
-        "LUT": 0.18141061859101543,
+        "LUT": 0.2310045667138294,
         "FF": 0.0,
         "BRAM_bits": 0.0
       },
       "kkt_diagnostics": {
         "converged": true,
         "sp_converged": true,
-        "sp_change": 0.000974075408697539,
+        "sp_change": 8.870094092117142e-05,
         "stationary": true,
         "stationarity_residual": 1.0408340855860843e-17,
         "primal_feasible": true,
@@ -482,7 +372,117 @@
         "complementary_slackness": true,
         "slackness_products": {
           "DSP": 0.0,
-          "LUT": 0.008450461626164245,
+          "LUT": 0.00167675668432859,
+          "FF": 0.0,
+          "BRAM_bits": 0.0
+        }
+      }
+    },
+    {
+      "iteration": 5,
+      "sp_val": 0.9781739012746349,
+      "sp_loss": 0.021826098725365117,
+      "lagrangian_cost": 0.029051911478963983,
+      "w_bits": {
+        "conv1d_1": 5,
+        "dense_1": 4,
+        "output_dense": 8
+      },
+      "a_bits": {
+        "conv1d_1": 8,
+        "dense_1": 8
+      },
+      "resources": {
+        "DSP": 0.0,
+        "LUT": 9374.767857111541,
+        "FF": 3278.879161181313,
+        "BRAM_bits": 18432.0
+      },
+      "g_raw": {
+        "DSP": -102.4,
+        "LUT": 253.95621904043946,
+        "FF": -25033.329849591784,
+        "BRAM_bits": -972472.3200000001
+      },
+      "g_val": {
+        "DSP": -1.0,
+        "LUT": 0.027843598696896996,
+        "FF": -0.8841885082180035,
+        "BRAM_bits": -0.9813988095238095
+      },
+      "mu": {
+        "DSP": 0.0,
+        "LUT": 0.2595143261565589,
+        "FF": 0.0,
+        "BRAM_bits": 0.0
+      },
+      "kkt_diagnostics": {
+        "converged": false,
+        "sp_converged": true,
+        "sp_change": 0.0002547062874924677,
+        "stationary": true,
+        "stationarity_residual": 2.0816681711721685e-17,
+        "primal_feasible": false,
+        "dual_feasible": true,
+        "complementary_slackness": true,
+        "slackness_products": {
+          "DSP": 0.0,
+          "LUT": 0.0072258127535988655,
+          "FF": 0.0,
+          "BRAM_bits": 0.0
+        }
+      }
+    },
+    {
+      "iteration": 6,
+      "sp_val": 0.9780932864462579,
+      "sp_loss": 0.021906713553742074,
+      "lagrangian_cost": 0.03120187280763145,
+      "w_bits": {
+        "conv1d_1": 5,
+        "dense_1": 4,
+        "output_dense": 3
+      },
+      "a_bits": {
+        "conv1d_1": 8,
+        "dense_1": 8
+      },
+      "resources": {
+        "DSP": 0.0,
+        "LUT": 9267.215060653149,
+        "FF": 3234.0971884284636,
+        "BRAM_bits": 18432.0
+      },
+      "g_raw": {
+        "DSP": -102.4,
+        "LUT": 303.4998862473258,
+        "FF": -25078.111822344636,
+        "BRAM_bits": -972472.3200000001
+      },
+      "g_val": {
+        "DSP": -1.0,
+        "LUT": 0.03385871598351449,
+        "FF": -0.8857702277064339,
+        "BRAM_bits": -0.9813988095238095
+      },
+      "mu": {
+        "DSP": 0.0,
+        "LUT": 0.2745278131165726,
+        "FF": 0.0,
+        "BRAM_bits": 0.0
+      },
+      "kkt_diagnostics": {
+        "converged": false,
+        "sp_converged": true,
+        "sp_change": 8.061482837695699e-05,
+        "stationary": true,
+        "stationarity_residual": 6.938893903907228e-18,
+        "primal_feasible": false,
+        "dual_feasible": true,
+        "complementary_slackness": true,
+        "slackness_products": {
+          "DSP": 0.0,
+          "LUT": 0.009295159253889376,
           "FF": 0.0,
           "BRAM_bits": 0.0
         }
@@ -491,24 +491,56 @@
   ],
   "final_multipliers_mu": {
     "DSP": 0.0,
-    "LUT": 0.18141061859101543,
+    "LUT": 0.2745278131165726,
     "FF": 0.0,
     "BRAM_bits": 0.0
   },
   "kkt_stopping_diagnostics": {
-    "converged": true,
+    "converged": false,
     "sp_converged": true,
-    "sp_change": 0.000974075408697539,
+    "sp_change": 8.061482837695699e-05,
     "stationary": true,
-    "stationarity_residual": 1.0408340855860843e-17,
-    "primal_feasible": true,
+    "stationarity_residual": 6.938893903907228e-18,
+    "primal_feasible": false,
     "dual_feasible": true,
     "complementary_slackness": true,
     "slackness_products": {
       "DSP": 0.0,
-      "LUT": 0.008450461626164245,
+      "LUT": 0.009295159253889376,
       "FF": 0.0,
       "BRAM_bits": 0.0
     }
+  },
+  "cv_confirmation": {
+    "w_bits": {
+      "conv1d_1": 5,
+      "dense_1": 4,
+      "output_dense": 3
+    },
+    "paired_diff_vs_u8": {
+      "mean": -0.0005006277078065003,
+      "std": 0.0003884749120622725,
+      "se": 0.00017373126218489884,
+      "n": 5
+    },
+    "paired_diff_vs_fp32": {
+      "mean": -0.00013716611151943782,
+      "std": 0.00035930377542081545,
+      "se": 0.0001606855332826523,
+      "n": 5
+    },
+    "paired_diff_holdout_vs_u8": {
+      "mean": -0.0004429966416459763,
+      "std": 0.0004245623041946275,
+      "se": 0.00018987003457262623,
+      "n": 5
+    },
+    "candidates_tested": [
+      {
+        "conv1d_1": 5,
+        "dense_1": 4,
+        "output_dense": 3
+      }
+    ]
   }
 }

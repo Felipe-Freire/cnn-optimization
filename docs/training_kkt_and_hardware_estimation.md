@@ -10,7 +10,7 @@ Todo o fluxo implementado em [`notebooks/01_quantized_cnn1d_optimization.ipynb`]
 
 ```mermaid
 flowchart TD
-    D["Dados ATLAS L0 Ringer (v2 = 25 Anéis)<br/>Normalização L1 + Split Estratificado (85% Dev / 15% Holdout)"] --> R["Treinamento do Modelo Referência FP32<br/>+ Cálculo do Traço da Hessiana de Hutchinson Tr(H_l)"]
+    D["Dados ATLAS L0 Ringer (v2 = 25 Anéis)<br/>Normalização L1 + Split Estratificado (80% Dev / 20% Holdout)"] --> R["Treinamento do Modelo Referência FP32<br/>+ Cálculo do Traço da Hessiana de Hutchinson Tr(H_l)"]
     R --> S1
 
     subgraph LOOP["Ciclo Fechado Primal-Dual (Iterações t = 1 ... T)"]
@@ -36,8 +36,8 @@ Os sinais de entrada provêm dos calorímetros eletromagnético (PS, EM1, EM2, E
 2. **Normalização $L_1$ por Evento**: A função [`norm1(X)`](file:///home/iaraujo/Documentos/Github/cnn-optimization/src/metrics.py#L84-L90) normaliza a energia depositada em cada anel pela energia absoluta total do respectivo chuveiro, garantindo invariância de escala frente à energia transversal ($E_T$):
    $$\hat{x}_i = \frac{x_i}{\sum_{m=1}^{25} |x_m|}, \quad i = 1, \dots, 25$$
 3. **Particionamento Estratificado**:
-   - **Conjunto de Desenvolvimento (`X_dev`, 85% = 65.557 eventos)**: utilizado para o treinamento de referência FP32, o loop de alocação de bits KKT e a validação cruzada em 5 folds;
-   - **Conjunto de Teste Isolado (`X_holdout`, 15% = 11.569 eventos)**: mantido completamente intocado durante todo o treinamento e otimização, servindo exclusivamente para o laudo final de generalização.
+   - **Conjunto de Desenvolvimento (`X_dev`, 80% = 61.700 eventos)**: utilizado para o treinamento de referência FP32, o loop de alocação de bits KKT e a validação cruzada em 5 folds;
+   - **Conjunto de Teste Isolado (`X_holdout`, 20% = 15.426 eventos)**: mantido completamente intocado durante todo o treinamento e otimização, servindo exclusivamente para o laudo final de generalização.
 
 ---
 
@@ -69,7 +69,7 @@ Durante o treinamento supervisionado no TensorFlow/QKeras, utilizamos **duas mé
    - O `SPCallback` salva em memória os pesos da época que atingiu o maior $SP_{\text{val}}$ (`restore_best_weights()`) e interrompe o treinamento caso o $SP_{\text{val}}$ não supere a marca histórica por `patience` épocas consecutivas.
 
 ### 1.4 Transferência de Pesos (*Warm-Start* QAT)
-A função [`transfer_weights_to_qmodel(model_fp32, qmodel)`](file:///home/iaraujo/Documentos/Github/cnn-optimization/src/models.py#L129-L146) copia os pesos já convergidos do modelo de referência FP32 para o modelo QKeras antes de iniciar o *Quantization-Aware Training* (QAT), eliminando variância estocástica de inicialização e acelerando a convergência.
+A função [`transfer_weights_to_qmodel(model_fp32, qmodel)`](file:///home/iaraujo/Documentos/Github/cnn-optimization/src/models.py#L129-L146) copia os pesos já convergidos do modelo de referência FP32 para o modelo QKeras antes de iniciar o *Quantization-Aware Training* (QAT), eliminando variância estocástica de inicialização e acelerando a convergência. Na validação cruzada, o FP32 de cada fold é treinado só com o treino daquele fold (`src/training.py`), para que nenhum evento de validação tenha sido visto pelo *warm-start*; FP32, 8 bits uniforme e a alocação escolhida usam os mesmos folds, a mesma semente e o mesmo *warm-start*, e o holdout é avaliado no limiar escolhido na validação de cada fold.
 
 ---
 
@@ -89,7 +89,7 @@ A resolução implementada em [`src/kkt_allocator.py`](file:///home/iaraujo/Docu
    - Com $B_{\text{DSP}} = 0$, limita $w_l, a_l \le 8\text{ bits}$ (sem `DSP48E2`). Para os preços $\mu_j$, cada bit de peso da camada $l$ custa $\pi_l = \sum_j \mu_j \, \frac{\partial R_j/\partial w_l}{B_j}$ e a condição de estacionaridade dá:
      $$w_l(\boldsymbol{\mu}) = \operatorname{clip}\!\left( \frac{1}{2} \log_2\!\left( \frac{c_l \ln 4}{\pi_l} \right), \, b_{\min}, \, b_{\max} \right)$$
    - Os preços são ajustados por ascensão dual até a solução contínua satisfazer as condições KKT ([`solve_relaxed_dual`](file:///home/iaraujo/Documentos/Github/cnn-optimization/src/kkt_allocator.py)); os bits inteiros são o ótimo exato da enumeração no modelo de custo.
-   - O notebook procura, por bisseção no orçamento de LUT, o menor custo que preserva o SP do 8 bits uniforme (seção 5 de `theory_and_formulation.md`). Em `et5_eta0` (teto de 1 % da VU13P), a escolha foi `w = [5, 5, 5]`, `a = [8, 8]`, entrada de 8 bits: SP de validação 97,86 % (8 bits uniforme: 97,92 %), 13,6 mil LUTs previstas pelo modelo calibrado (51 % do 8 bits uniforme), 0 DSP. CV em 5 folds: SP 97,80 ± 0,20 %.
+   - O notebook procura, por bisseção no orçamento de LUT, o menor custo que preserva o SP do 8 bits uniforme (seção 5 de `theory_and_formulation.md`). Em `et5_eta0` (teto de 1 % da VU13P), a escolha foi `w = [5, 4, 3]`, `a = [8, 8]`, entrada de 8 bits: 9,3 mil LUTs previstas pelo modelo calibrado (40 % do 8 bits uniforme), 0 DSP. CV pareada em 5 folds: SP 97,72 %, diferença para o 8 bits uniforme de −0,05 ± 0,04 p.p. (erro padrão 0,02) e para o FP32 de −0,01 ± 0,04 p.p.; holdout no limiar da validação, média dos folds: 97,70 % (8 bits: 97,75 %, FP32: 97,71 %).
 
 ---
 
