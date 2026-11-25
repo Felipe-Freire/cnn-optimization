@@ -1,16 +1,56 @@
-"""Hardware metrics and Virtex UltraScale+ VU13P resource estimator with qkeras.qtools integration."""
+"""Hardware metrics and Virtex UltraScale+ VU13P resource estimator with qkeras.qtools integration.
+
+Resource model (DSP, LUT, FF, BRAM)
+-----------------------------------
+In hls4ml ``io_parallel`` / ``Latency`` / ``ReuseFactor=1`` the weights are constants wired into the
+logic, so the cost of a layer is set by the adder trees that implement its constant multiplications,
+not by a generic w x a multiplier:
+
+* a zero weight costs nothing and a power-of-two weight is a shift (wiring);
+* a constant with d nonzero canonical-signed-digit (CSD) digits costs (d - 1) adders, unless it is
+  wide (max(w, a_in) > 10 bits) and has >= 3 digits, in which case HLS maps it to one DSP48E2;
+* the accumulators feeding each ReLU (+ max-pooling) add logic that does not shrink with the trees;
+* weights are never stored in BRAM: the only RAM block is the sigmoid table (1 RAMB18).
+
+Per layer l (positions P_l computed in parallel, fan-in n_l, integer weight codes k):
+
+    adders_l     = P_l * sum_o [ (terms_o - 1) + sum_{k in o, LUT} (csd(k) - 1) ]
+    adder_bits_l = adders_l * (a_in,l + w_l + ceil(log2 n_l) / 2)
+    relu_bits_l  = P_l * n_out,l * (a_in,l + w_l + ceil(log2 n_l))   if a ReLU follows l
+    DSP_l        = P_l * #{k : max(w_l, a_in,l) > 10 and csd(k) >= 3}
+
+    LUT = beta_LUT * sum adder_bits + gamma_LUT * sum relu_bits
+    FF  = beta_FF  * sum adder_bits + delta_FF * DSP + gamma_FF
+
+The coefficients are fitted by least squares on post-route utilization of this network synthesized
+with hls4ml -> Vitis HLS -> Vivado (src/calibration/vu13p_hls4ml_synthesis.json, produced by the
+cnn-fpga-research repository). ``CostModel.calibration_table`` reports the fit and leave-one-out
+errors; ``CostModel.margins`` turns the worst leave-one-out under-prediction of each resource into a
+safety margin for the budgets. Validity domain: io_parallel, Latency, ReuseFactor = 1, Conv1D with
+ParallelizationFactor = output width, VU13P at 240 MHz, this topology.
+
+``estimate_hardware_resources`` keeps the MAC-based analytical estimate (LUT = MAC w a / 18, ...),
+which does not see weight values or adder trees and under-predicts synthesized LUTs by 3x-24x;
+decisions should use ``calibrated_resources`` / ``make_cost_fn``.
+"""
 
 import json
 import math
 import os
 import tempfile
-from typing import Any, Dict, List, Optional, Union
+from dataclasses import dataclass, field
+from functools import lru_cache
+from pathlib import Path
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, Union
 
 os.environ["TF_USE_LEGACY_KERAS"] = "1"
+import numpy as np
 import tensorflow as tf
 import qkeras
 from qkeras.qtools import run_qtools
 from qkeras.qtools import settings as qtools_settings
+
+from src.models import quantizer_integer_bits
 
 # AMD/Xilinx Virtex UltraScale+ VU13P Official Limits (Table 15 - FPGA Feature Summary)
 VU13P_CHIP_LIMITS: Dict[str, float] = {
@@ -29,8 +69,13 @@ VU13P_LIMITS: Dict[str, float] = {
 }
 
 
+RAMB18_BITS = 18 * 1024
+CALIBRATION_PATH = Path(__file__).resolve().parent / "calibration" / "vu13p_hls4ml_synthesis.json"
+
+
 def get_vu13p_budget(
     scale_factors: Optional[Dict[str, float]] = None,
+    margins: Optional[Dict[str, float]] = None,
 ) -> Dict[str, float]:
     """Returns effective hardware resource budgets B_j on the Virtex UltraScale+ VU13P.
 
@@ -41,17 +86,19 @@ def get_vu13p_budget(
     Args:
         scale_factors: Optional dict mapping resource key ('DSP', 'LUT', 'FF', 'BRAM_bits')
             to a fraction in (0, 1] or explicit limit override.
+        margins: Optional relative safety margin per resource (e.g. CostModel.margins); the
+            budget becomes B_j / (1 + m_j), so that a configuration the cost model places at the
+            limit still fits if the model under-predicts by m_j.
 
     Returns:
         Dictionary of resource budgets B_j for {'DSP', 'LUT', 'FF', 'BRAM_bits'}.
     """
-    if scale_factors is None:
-        return VU13P_LIMITS.copy()
-
     budgets = {}
     for k, chip_max in VU13P_LIMITS.items():
-        factor = scale_factors.get(k, 1.0)
+        factor = 1.0 if scale_factors is None else scale_factors.get(k, 1.0)
         budgets[k] = float(chip_max * factor) if factor <= 1.0 else float(factor)
+    if margins:
+        budgets = {k: v / (1.0 + float(margins.get(k, 0.0))) for k, v in budgets.items()}
     return budgets
 
 
@@ -82,6 +129,290 @@ def _compute_layer_names(model: tf.keras.Model) -> List[str]:
         if ("Conv1D" in layer.__class__.__name__ or "Dense" in layer.__class__.__name__)
         and hasattr(layer, "kernel")
     ]
+
+
+def csd_digits(n: int) -> int:
+    """Nonzero digits of |n| in canonical signed-digit form (0 for n = 0, 1 for powers of two)."""
+    n = abs(int(n))
+    count = 0
+    while n:
+        if n & 1:
+            n -= 2 - (n & 3)  # digit +1 or -1
+            count += 1
+        n >>= 1
+    return count
+
+
+def quantize_weights_int(values: np.ndarray, bits: int) -> np.ndarray:
+    """Integer codes k of quantized_bits(bits, I, alpha=1) applied to float weights (w_q = k * LSB)."""
+    integer = quantizer_integer_bits(bits)
+    lsb = 2.0 ** (integer + 1 - int(bits))
+    quantized = np.asarray(qkeras.quantized_bits(int(bits), integer, alpha=1)(np.asarray(values, dtype=np.float32)))
+    return np.rint(quantized / lsb).astype(np.int64)
+
+
+@dataclass
+class LayerSpec:
+    """What the structural cost model needs about one compute layer."""
+
+    name: str
+    kernel_int: np.ndarray  # integer weight codes, shape (fan_in, n_out)
+    bias_int: np.ndarray    # integer bias codes, shape (n_out,)
+    w_bits: int
+    a_in_bits: int
+    positions: int = 1      # output positions computed in parallel (Conv1D: output width)
+    relu_after: bool = False
+
+    @property
+    def fan_in(self) -> int:
+        return int(self.kernel_int.shape[0])
+
+
+def layer_features(spec: LayerSpec, dsp_min_bits: int = 10, dsp_min_csd: int = 3) -> Dict[str, float]:
+    """Adders, adder bits, ReLU input bits and DSPs of one layer (see module docstring)."""
+    k = np.asarray(spec.kernel_int)
+    b = np.asarray(spec.bias_int).ravel()
+    wide = max(spec.w_bits, spec.a_in_bits) > dsp_min_bits
+    csd = np.vectorize(csd_digits, otypes=[np.int64])(k) if k.size else k
+    nonzero = k != 0
+    dsp_mask = nonzero & wide & (csd >= dsp_min_csd)
+    extra_adders = np.where(nonzero & ~dsp_mask, csd - 1, 0)
+    terms = nonzero.sum(axis=0) + (b != 0).astype(np.int64)
+    adders = float(np.maximum(terms - 1, 0).sum() + extra_adders.sum()) * spec.positions
+    log_fan_in = math.ceil(math.log2(max(spec.fan_in, 1)))
+    width = spec.a_in_bits + spec.w_bits + log_fan_in / 2.0
+    acc_width = spec.a_in_bits + spec.w_bits + log_fan_in
+    return {
+        "adders": adders,
+        "adder_bits": adders * width,
+        "relu_bits": float(spec.positions * k.shape[1] * acc_width) if spec.relu_after else 0.0,
+        "DSP": float(dsp_mask.sum() * spec.positions),
+        "nonzero_frac": float(nonzero.mean()) if k.size else 0.0,
+    }
+
+
+@dataclass
+class CostModel:
+    """Structural VU13P cost model with coefficients fitted on synthesized points."""
+
+    beta_lut: float
+    gamma_lut: float
+    beta_ff: float
+    delta_ff: float
+    gamma_ff: float
+    ramb18: float = 1.0
+    dsp_min_bits: int = 10
+    dsp_min_csd: int = 3
+    calibration: List[Dict[str, Any]] = field(default_factory=list)
+
+    def layer_resources(self, spec: LayerSpec) -> Dict[str, float]:
+        f = layer_features(spec, self.dsp_min_bits, self.dsp_min_csd)
+        return {
+            "DSP": f["DSP"],
+            "LUT": self.beta_lut * f["adder_bits"] + self.gamma_lut * f["relu_bits"],
+            "FF": self.beta_ff * f["adder_bits"] + self.delta_ff * f["DSP"],
+            "adder_bits": f["adder_bits"],
+            "relu_bits": f["relu_bits"],
+            "nonzero_frac": f["nonzero_frac"],
+        }
+
+    def estimate(self, specs: Sequence[LayerSpec]) -> Dict[str, float]:
+        """Totals: DSP, LUT, FF, RAMB18 and BRAM_bits (= RAMB18 x 18 Kb), plus the features."""
+        total = {"DSP": 0.0, "LUT": 0.0, "FF": self.gamma_ff, "adder_bits": 0.0, "relu_bits": 0.0}
+        for spec in specs:
+            res = self.layer_resources(spec)
+            for key in ("DSP", "LUT", "FF", "adder_bits", "relu_bits"):
+                total[key] += res[key]
+        total["RAMB18"] = self.ramb18
+        total["BRAM_bits"] = self.ramb18 * RAMB18_BITS
+        return total
+
+    @property
+    def margins(self) -> Dict[str, float]:
+        """Worst leave-one-out under-prediction per resource (fraction), for get_vu13p_budget."""
+        out = {}
+        for key in ("DSP", "LUT", "FF"):
+            errs = [c["loo_rel_err"][key] for c in self.calibration if c["in_domain"] and c["loo_rel_err"]]
+            out[key] = float(max([0.0] + [-e for e in errs if np.isfinite(e)]))
+        return out
+
+    @staticmethod
+    def _design(rows):
+        adder_bits = np.array([r["adder_bits"] for r in rows])
+        relu_bits = np.array([r["relu_bits"] for r in rows])
+        dsp = np.array([r["DSP_pred"] for r in rows])
+        return np.c_[adder_bits, relu_bits], np.c_[adder_bits, dsp, np.ones_like(adder_bits)]
+
+    @classmethod
+    def from_calibration(cls, path: Union[str, Path] = CALIBRATION_PATH, dsp_min_bits: int = 10,
+                         dsp_min_csd: int = 3) -> "CostModel":
+        """Least-squares fit on the in-domain points (Conv1D fully parallel), with leave-one-out errors."""
+        points = json.loads(Path(path).read_text())["points"]
+        rows = []
+        for p in points:
+            specs = [
+                LayerSpec(name, np.asarray(l["kernel_int"]), np.asarray(l["bias_int"]), l["w_bits"],
+                          l["a_in_bits"], l["positions_parallel"], l.get("relu_after", False))
+                for name, l in p["layers"].items()
+            ]
+            feats = [layer_features(s, dsp_min_bits, dsp_min_csd) for s in specs]
+            rows.append({
+                "name": p["name"],
+                "in_domain": p["conv_parallelization_factor"] > 1,
+                "adder_bits": sum(f["adder_bits"] for f in feats),
+                "relu_bits": sum(f["relu_bits"] for f in feats),
+                "DSP_pred": sum(f["DSP"] for f in feats),
+                "measured": {k: float(p["post_route"][k]) for k in ("DSP", "LUT", "FF")},
+            })
+        fit = [r for r in rows if r["in_domain"]]
+
+        def solve(rows_):
+            x_lut, x_ff = cls._design(rows_)
+            c_lut = np.linalg.lstsq(x_lut, np.array([r["measured"]["LUT"] for r in rows_]), rcond=None)[0]
+            c_ff = np.linalg.lstsq(x_ff, np.array([r["measured"]["FF"] for r in rows_]), rcond=None)[0]
+            return c_lut, c_ff
+
+        def predict(c_lut, c_ff, row):
+            x_lut, x_ff = cls._design([row])
+            return {"DSP": row["DSP_pred"], "LUT": float(x_lut[0] @ c_lut), "FF": float(x_ff[0] @ c_ff)}
+
+        def rel(pred, meas):
+            return {k: (pred[k] - meas[k]) / meas[k] if meas[k] else (0.0 if pred[k] == 0 else float("inf"))
+                    for k in pred}
+
+        c_lut, c_ff = solve(fit)
+        model = cls(float(c_lut[0]), float(c_lut[1]), float(c_ff[0]), float(c_ff[1]), float(c_ff[2]),
+                    dsp_min_bits=dsp_min_bits, dsp_min_csd=dsp_min_csd)
+        enough = len(fit) > 3  # leave-one-out needs more points than FF coefficients
+        for row in rows:
+            pred = predict(c_lut, c_ff, row)
+            entry = {"name": row["name"], "in_domain": row["in_domain"], "predicted": pred,
+                     "measured": row["measured"], "rel_err": rel(pred, row["measured"]), "loo_rel_err": None}
+            if row["in_domain"] and enough:
+                cl, cf = solve([q for q in fit if q["name"] != row["name"]])
+                entry["loo_rel_err"] = rel(predict(cl, cf, row), row["measured"])
+            model.calibration.append(entry)
+        return model
+
+    def calibration_table(self) -> List[Dict[str, Any]]:
+        """Measured vs predicted per synthesis point (fit and leave-one-out relative errors)."""
+        out = []
+        for c in self.calibration:
+            row = {"point": c["name"], "in_domain": c["in_domain"]}
+            for k in ("DSP", "LUT", "FF"):
+                row[f"{k}_measured"] = c["measured"][k]
+                row[f"{k}_predicted"] = c["predicted"][k]
+                row[f"{k}_rel_err"] = c["rel_err"][k]
+                row[f"{k}_loo_rel_err"] = c["loo_rel_err"][k] if c["loo_rel_err"] else float("nan")
+            out.append(row)
+        return out
+
+
+@lru_cache(maxsize=1)
+def get_cost_model() -> CostModel:
+    return CostModel.from_calibration(CALIBRATION_PATH)
+
+
+def _followed_by_relu(model: tf.keras.Model, layer) -> bool:
+    """True if the layer output goes through a ReLU (fused FP32 activation or a following QActivation)."""
+    if getattr(getattr(layer, "activation", None), "__name__", "") == "relu":
+        return True
+    layers = list(model.layers)
+    i = layers.index(layer)
+    if i + 1 < len(layers) and layers[i + 1].__class__.__name__ == "QActivation":
+        return "relu" in str(getattr(layers[i + 1], "quantizer", layers[i + 1].activation))
+    return False
+
+
+def layer_specs_from_model(
+    model: tf.keras.Model,
+    weights_bits: Optional[Dict[str, int]] = None,
+    act_bits: Optional[Union[int, Dict[str, int]]] = 8,
+    input_bits: int = 8,
+    default_weight_bits: int = 8,
+    default_act_bits: int = 8,
+) -> List[LayerSpec]:
+    """LayerSpecs of a (FP32 or QKeras) model, quantizing its float weights with the model's quantizer.
+
+    For an FP32 model this is post-training quantization of the reference weights, which is how the
+    cost of a configuration is predicted before it is trained.
+    """
+    weights_bits = weights_bits or {}
+    if isinstance(act_bits, dict):
+        act_map, fill = dict(act_bits), default_act_bits
+    else:
+        act_map, fill = {}, default_act_bits if act_bits is None else int(act_bits)
+    layers = [model.get_layer(name) for name in _compute_layer_names(model)]
+    a_in = layer_input_bits([l.name for l in layers], act_map, input_bits, fill)
+    specs = []
+    for layer in layers:
+        w_bits = int(weights_bits.get(layer.name, default_weight_bits))
+        kernel = layer.kernel.numpy()
+        n_out = kernel.shape[-1]
+        bias = layer.bias.numpy() if getattr(layer, "bias", None) is not None else np.zeros(n_out, np.float32)
+        positions = int(layer.output_shape[1]) if "Conv1D" in layer.__class__.__name__ else 1
+        specs.append(LayerSpec(
+            layer.name,
+            quantize_weights_int(kernel, w_bits).reshape(-1, n_out),
+            quantize_weights_int(bias, w_bits),
+            w_bits,
+            a_in[layer.name],
+            positions,
+            relu_after=_followed_by_relu(model, layer),
+        ))
+    return specs
+
+
+def calibrated_resources(
+    model: tf.keras.Model,
+    weights_bits: Optional[Dict[str, int]] = None,
+    act_bits: Optional[Union[int, Dict[str, int]]] = 8,
+    input_bits: int = 8,
+    cost_model: Optional[CostModel] = None,
+) -> Dict[str, Any]:
+    """Calibrated VU13P resources of a model: totals {DSP, LUT, FF, BRAM_bits, RAMB18} and per layer."""
+    cm = cost_model or get_cost_model()
+    specs = layer_specs_from_model(model, weights_bits, act_bits, input_bits)
+    total = cm.estimate(specs)
+    return {
+        "total": {k: float(total[k]) for k in ("DSP", "LUT", "FF", "BRAM_bits", "RAMB18")},
+        "layers": {s.name: cm.layer_resources(s) for s in specs},
+    }
+
+
+def make_cost_fn(
+    model: tf.keras.Model,
+    input_bits: int = 8,
+    cost_model: Optional[CostModel] = None,
+) -> Callable[[Dict[str, int], Dict[str, int]], Dict[str, float]]:
+    """Cost function (weights_bits, act_bits) -> {DSP, LUT, FF, BRAM_bits} for the bit allocator.
+
+    Uses the float weights of ``model`` (e.g. the FP32 reference) quantized at each candidate
+    precision. Each layer depends only on (w_l, a_in,l), so per-layer results are cached.
+    """
+    cm = cost_model or get_cost_model()
+    layers = [model.get_layer(name) for name in _compute_layer_names(model)]
+    names = [l.name for l in layers]
+    cache: Dict[Tuple[str, int, int], Dict[str, float]] = {}
+
+    def layer_cost(layer, w_bits: int, a_in_bits: int) -> Dict[str, float]:
+        key = (layer.name, w_bits, a_in_bits)
+        if key not in cache:
+            spec = layer_specs_from_model(model, {layer.name: w_bits}, {}, input_bits)[names.index(layer.name)]
+            spec.a_in_bits = a_in_bits
+            cache[key] = cm.layer_resources(spec)
+        return cache[key]
+
+    def cost_fn(weights_bits: Dict[str, int], act_bits: Dict[str, int]) -> Dict[str, float]:
+        a_in = layer_input_bits(names, act_bits, input_bits)
+        out = {"DSP": 0.0, "LUT": 0.0, "FF": cm.gamma_ff, "BRAM_bits": cm.ramb18 * RAMB18_BITS}
+        for layer in layers:
+            res = layer_cost(layer, int(weights_bits[layer.name]), a_in[layer.name])
+            for key in ("DSP", "LUT", "FF"):
+                out[key] += res[key]
+        return out
+
+    return cost_fn
 
 
 def _format_ap_fixed(q_info: Optional[Dict[str, Any]], default_bits: int = 8, default_int: int = 2) -> str:
@@ -122,7 +453,7 @@ def extract_qtools_hardware_profile(
     )
     for_reference = not has_qkeras_layers
 
-    source_q = [qkeras.quantized_bits(bits=input_bits, integer=input_int_bits, alpha=1)]
+    source_q = [qkeras.quantized_bits(bits=input_bits, integer=input_int_bits, keep_negative=False, alpha=1)]
     q = run_qtools.QTools(
         model,
         process=process,
@@ -209,7 +540,10 @@ def extract_qtools_hardware_profile(
 def estimate_hardware_resources(
     model_config: List[Dict[str, Any]],
 ) -> Dict[str, float]:
-    """Estimates Virtex UltraScale+ VU13P resource usage (DSP, LUT, FF, BRAM_bits) from layer config.
+    """MAC-based analytical VU13P estimate (DSP, LUT, FF, BRAM_bits) from a layer config.
+
+    It does not see weight values, adder trees or the hls4ml mapping and under-predicts synthesized
+    LUTs by 3x-24x; use calibrated_resources / make_cost_fn for decisions.
 
     Follows UltraScale+ synthesis rules:
     - If w_bits <= 8 and a_bits <= 8: sub-byte arithmetic is mapped onto CLB LUTs:
@@ -483,6 +817,9 @@ def compute_model_hardware_costs(
     ``act_bits`` is keyed by the layer whose ReLU output is quantized; each layer is costed with
     the precision of its input (layer_input_bits), reported as ``b_a`` in the breakdown, so
     BOPs = sum_l MAC_l * w_l * a_in,l. ``input_bits`` is the precision of the input rings.
+
+    ``vu13p_resources`` and the per-layer DSP/LUT/FF come from the calibrated structural model
+    (calibrated_resources) applied to the model's weights quantized at ``weights_bits``.
     """
     if weights_bits is None:
         weights_bits = {}
@@ -525,7 +862,7 @@ def compute_model_hardware_costs(
     total_bops = 0
     total_weight_bits = 0
     layer_breakdown = []
-    model_config_for_vu13p = []
+    calibrated = calibrated_resources(model, weights_bits, act_bits, input_bits)
 
     for layer in model.layers:
         layer_cls = layer.__class__.__name__
@@ -552,12 +889,7 @@ def compute_model_hardware_costs(
             num_weights = int(layer.count_params())
             weight_bits = num_weights * b_w
 
-            layer_vu13p = estimate_hardware_resources([{
-                "w_bits": b_w,
-                "a_bits": b_a,
-                "params": num_weights,
-                "macc": macs,
-            }])
+            layer_vu13p = calibrated["layers"][layer.name]
 
             q_det = detailed_by_name.get(layer.name, {})
 
@@ -581,24 +913,16 @@ def compute_model_hardware_costs(
                 "params": num_weights,
                 "DSP": layer_vu13p["DSP"],
                 "LUT": layer_vu13p["LUT"],
-                "LUT_adder_tree_rf": q_det.get("LUT_adder_tree_rf", 0.0),
                 "FF": layer_vu13p["FF"],
-                "FF_line_buffer": q_det.get("FF_line_buffer", 0.0),
-                "BRAM_bits": layer_vu13p["BRAM_bits"],
+                "BRAM_bits": 0.0,  # weights are constants in the logic; the sigmoid RAMB18 is in the total
+                "adder_bits": layer_vu13p["adder_bits"],
+                "nonzero_weight_frac": layer_vu13p["nonzero_frac"],
                 "latency_cycles": q_det.get("latency_cycles", 2),
                 "latency_ns": q_det.get("latency_ns", 8.0),
                 "energy_pj": q_det.get("energy_pj", 0.0),
             })
 
-            model_config_for_vu13p.append({
-                "layer_name": layer.name,
-                "w_bits": b_w,
-                "a_bits": b_a,
-                "params": num_weights,
-                "macc": macs,
-            })
-
-    vu13p_resources = estimate_hardware_resources(model_config_for_vu13p)
+    vu13p_resources = {k: calibrated["total"][k] for k in ("DSP", "LUT", "FF", "BRAM_bits")}
 
     return {
         "total_macs": total_macs,

@@ -167,13 +167,25 @@ No contexto real de operação do trigger de Nível 0 (L0) do experimento ATLAS 
 
 Conforme a **Tabela 15 (*Virtex UltraScale+ FPGA Feature Summary*)** da documentação oficial da AMD/Xilinx, a capacidade total do dispositivo ($\mathbf{B}_{\text{chip}}$) e o orçamento fracionário dedicado a uma instância individual do classificador Ringer ($B_j = \alpha_j \cdot B_{j, \text{chip}}$, onde $\alpha_j \in (0, 1]$ representa a fração de área/recursos alocada ao núcleo neural) são definidos por:
 
-| Recurso Físico ($j$) | Capacidade Total da VU13P ($B_{j, \text{chip}}$) | Modelo de Consumo por Camada $l \in \{1, \dots, L\}$ |
-| :--- | :--- | :--- |
-| **DSP Slices** (`DSP`) | $12.288\text{ slices}$ | $\text{DSP}_l(w_l, a_l, n_l)$ — Alocado quando $w_l > 8$ ou $a_l > 8$ |
-| **CLB LUTs** (`LUT`) | $1.728.000\text{ LUTs}$ | $\text{LUT}_l(w_l, a_l, n_l) \approx \text{MAC}_l \cdot \frac{w_l \cdot a_l}{18}$ (quando $w_l \le 8, a_l \le 8$) |
-| **CLB Flip-Flops** (`FF`) | $3.456.000\text{ FFs}$ | $\text{FF}_l(w_l, a_l, n_l) \approx P_l \cdot w_l + N_{\text{out}, l} \cdot a_l$ |
-| **Block RAM** (`BRAM`) | $94,5\text{ Mb}$ ($2.688 \times 36\text{ Kb}$) | $\text{Bits}_l(w_l, n_l) = P_l \cdot w_l$ |
-| **UltraRAM** (`URAM`) | $360,0\text{ Mb}$ ($1.280 \times 288\text{ Kb}$) | Memória massiva unificada ($B_{\text{Mem}} = B_{\text{BRAM}} + B_{\text{URAM}}$) |
+| Recurso Físico ($j$) | Capacidade Total da VU13P ($B_{j, \text{chip}}$) |
+| :--- | :--- |
+| **DSP Slices** (`DSP`) | $12.288\text{ slices}$ |
+| **CLB LUTs** (`LUT`) | $1.728.000\text{ LUTs}$ |
+| **CLB Flip-Flops** (`FF`) | $3.456.000\text{ FFs}$ |
+| **Block RAM** (`BRAM`) | $94,5\text{ Mb}$ ($2.688 \times 36\text{ Kb}$) |
+| **UltraRAM** (`URAM`) | $360,0\text{ Mb}$ ($1.280 \times 288\text{ Kb}$) |
+
+**Orçamento da instância.** Uma única rede na VU13P, dividindo o chip com outros algoritmos do trigger. Cada recurso recebe no máximo $\alpha_j = 1\,\%$ do chip (17.280 LUTs, 34.560 FFs, 122 DSPs), dividido pela margem do modelo de custo, $B_j = \alpha_j B_{j,\text{chip}} / (1 + m_j)$ (`get_vu13p_budget(..., margins=CostModel.margins)`). Dentro desse teto, o objetivo é o menor consumo que preserva o SP e a latência.
+
+#### Modelo de consumo calibrado na síntese
+
+Com hls4ml em `io_parallel`, `Latency` e `ReuseFactor = 1`, os pesos são constantes embutidas na lógica. Multiplicar por uma constante é somar versões deslocadas da entrada: um peso nulo não custa nada, uma potência de 2 é só fio, e uma constante com $d$ dígitos não nulos em CSD (*canonical signed digit*) custa $d - 1$ somadores. Constantes largas ($\max(w_l, a_{\text{in},l}) > 10$) com 3 ou mais dígitos vão para um DSP48E2. Os pesos não ocupam BRAM; o único bloco de RAM é a tabela da sigmoide (1 RAMB18). Para a camada $l$ com $P_l$ posições em paralelo, fan-in $n_l$ e códigos inteiros $k$ dos pesos (`src/hardware.py`, `CostModel`):
+
+$$\text{somadores}_l = P_l \sum_{o} \Big[(\text{termos}_o - 1) + \sum_{k \in o} (\text{csd}(k) - 1)\Big], \qquad \text{bits}_l = \text{somadores}_l \Big(a_{\text{in},l} + w_l + \tfrac{1}{2}\lceil \log_2 n_l \rceil\Big)$$
+
+$$\text{LUT} = \beta_{\text{LUT}} \sum_l \text{bits}_l + \gamma_{\text{LUT}} \sum_l \text{ReLU}_l, \qquad \text{FF} = \beta_{\text{FF}} \sum_l \text{bits}_l + \delta_{\text{FF}} \, \text{DSP} + \gamma_{\text{FF}}$$
+
+onde $\text{ReLU}_l = P_l \, n^{\text{out}}_l (a_{\text{in},l} + w_l + \lceil \log_2 n_l \rceil)$ conta os bits de acumulador que entram na ReLU e no pooling. Os coeficientes são ajustados por mínimos quadrados na utilização pós-rota desta rede sintetizada (hls4ml → Vitis HLS → Vivado, `xcvu13p-flga2577-2-e`, 240 MHz; `src/calibration/vu13p_hls4ml_synthesis.json`, gerado pelo repositório `cnn-fpga-research`). Com 6 pontos no domínio, o erro de LUT deixando cada ponto fora do ajuste fica entre −12,5 % e +20,4 %; a pior subestimação de cada recurso é a margem $m_j$ (LUT 12,5 %, FF 22,1 %, DSP 20 %). O modelo vale para `io_parallel`, `ReuseFactor = 1` e Conv1D totalmente paralela; fora disso são necessárias novas sínteses. Como o custo depende dos pesos treinados, a previsão antes do QAT usa os pesos FP32 quantizados (`make_cost_fn`) e a configuração final é recalculada com os pesos treinados.
 
 ### 4.1 Variáveis de Decisão e Função Objetivo Baseada no Índice-SP Existente
 

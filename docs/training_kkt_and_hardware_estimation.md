@@ -103,7 +103,7 @@ Em [`src/hardware.py`](file:///home/iaraujo/Documentos/Github/cnn-optimization/s
      - `dense_1` ($w_2=5, a_2=8$): multiplicador `ap_fixed<13, 5>`, acumulador **`ap_fixed<20, 12>`**;
      - `output_dense` ($w_3=8, a_3=8$): multiplicador `ap_fixed<16, 5>`, acumulador **`ap_fixed<20, 9>`**;
    - Calcula o consumo energético por inferência em **picojoules (pJ)** via `qtools.pe()` ($240\text{ pJ}$ de núcleo computacional / $271\text{ pJ}$ incluindo I/O para o modelo ótimo KKT).
-2. **Mapeamento em Recursos da Virtex UltraScale+ VU13P (`estimate_hardware_resources` & `estimate_vu13p_detailed_resources`)**:
-   - **DSP48E2 vs. CLB LUTs**: para $w_l \le 8, a_l \le 8$, $\text{DSP}_l = 0$ e $\text{LUT}_l = \text{MAC}_l (w_l \cdot a_l)/18$, além de decompor as LUTs de multiplicadores vs. árvores de soma (`LUT_adder_tree_rf`) em função do `ReuseFactor` ($RF_l$);
-   - **Flip-Flops e Line Buffers 1D**: estima os registradores de janela deslizante 1D da `QConv1D` (`FF_line_buffer`) e os registradores de *datapath* (`FF_datapath_rf`);
-   - **Memória On-Chip (`BRAM_bits` / `LUTRAM_bits`)** e **Latência em Ciclos e Nanossegundos** ($\text{Latência}_l = RF_l + \lceil \log_2(\text{fan-in}_l) \rceil + 1$ ciclos a $250\text{ MHz} \to 4,0\text{ ns/ciclo}$).
+2. **Recursos da VU13P pelo modelo calibrado (`calibrated_resources`, `make_cost_fn`)**:
+   - Conta somadores das árvores de soma a partir dos pesos inteiros (zeros e potências de 2 não custam multiplicador; constantes com $d$ dígitos CSD custam $d - 1$ somadores; constantes largas vão para DSP48E2), mais a lógica de ReLU/pooling; `BRAM_bits` é a tabela da sigmoide (1 RAMB18);
+   - Coeficientes ajustados nas sínteses desta rede (`src/calibration/vu13p_hls4ml_synthesis.json`); as margens do ajuste entram no orçamento (`get_vu13p_budget(..., margins=...)`). Detalhes na Seção 4 de `theory_and_formulation.md`;
+   - `estimate_vu13p_detailed_resources` continua fornecendo tipos de acumulador e energia do QTools; sua latência é uma estimativa analítica (as sínteses deram 9 a 12 ciclos a 240 MHz, II = 1).

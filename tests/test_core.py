@@ -9,11 +9,18 @@ import tensorflow as tf
 
 from src.metrics import compute_sp, norm1
 from src.hardware import (
+    RAMB18_BITS,
     VU13P_LIMITS,
+    LayerSpec,
+    calibrated_resources,
     compute_model_hardware_costs,
+    csd_digits,
     estimate_hardware_resources,
+    get_cost_model,
     get_vu13p_budget,
+    layer_features,
     layer_input_bits,
+    make_cost_fn,
 )
 from src.kkt_allocator import (
     LagrangeKKTQuantizerOptimizer,
@@ -150,13 +157,13 @@ def test_hardware_costs_use_the_precision_entering_each_layer(act_bits, expected
 
 
 def test_input_quantizer_matches_the_costed_input_format():
-    """input_bits=b quantizes the rings to quantized_bits(b, 0): step 2^-(b-1) in [-1, 1)."""
+    """input_bits=b quantizes the (non-negative) rings to unsigned ufixed<b, 0>: step 2^-b in [0, 1)."""
     model = build_compact_qcnn1d(input_dim=25, input_bits=6)
     x = np.linspace(-0.2, 1.2, 25, dtype=np.float32)[None, :]
     xq = model.get_layer("input_quant")(x).numpy()
-    step = 2.0 ** -5
+    step = 2.0 ** -6
     assert np.allclose(xq / step, np.round(xq / step))
-    assert xq.min() >= -1.0 and xq.max() <= 1.0 - step + 1e-7
+    assert xq.min() == 0.0 and xq.max() <= 1.0 - step + 1e-7
 
     hw = compute_model_hardware_costs(model, input_dim=25, input_bits=6)
     assert hw["breakdown"][0]["b_a"] == 6
@@ -263,6 +270,100 @@ def test_lagrangian_counts_slack_constraints():
     cost, g = opt.lagrangian_penalty(0.1, {"LUT": 800.0})
     assert g["LUT"] == pytest.approx(-0.2)
     assert cost == pytest.approx(0.1 - 0.5 * 0.2)
+
+
+def test_csd_digits():
+    expected = {0: 0, 1: 1, 2: 1, -4: 1, 3: 2, 7: 2, -7: 2, 5: 2, 23: 3, 255: 2}
+    assert {n: csd_digits(n) for n in expected} == expected
+
+
+def test_zero_and_power_of_two_weights_need_no_extra_adders():
+    """Each nonzero term adds to the neuron's adder tree; only non-power-of-two constants add more."""
+    shifts = LayerSpec("d", np.array([[0], [1], [2], [-4]]), np.array([0]), w_bits=4, a_in_bits=8)
+    assert layer_features(shifts)["adders"] == 2.0  # 3 nonzero terms -> 2 adders, no multipliers
+    seven = LayerSpec("d", np.array([[7], [0], [0], [0]]), np.array([0]), w_bits=4, a_in_bits=8)
+    assert layer_features(seven)["adders"] == 1.0  # 7 = 8 - 1 -> one adder
+    assert layer_features(seven)["DSP"] == 0.0
+
+
+def test_cost_model_reproduces_the_synthesized_points():
+    """Fit on the hls4ml/Vivado points of this network; in-domain errors stay within the observed range."""
+    cm = get_cost_model()
+    rows = [r for r in cm.calibration_table() if r["in_domain"]]
+    assert len(rows) >= 6
+    for r in rows:
+        assert abs(r["LUT_rel_err"]) < 0.20, r
+        assert abs(r["FF_rel_err"]) < 0.15, r
+        assert abs(r["DSP_predicted"] - r["DSP_measured"]) <= max(2.0, 0.01 * r["DSP_measured"]), r
+    assert all(0.0 < m < 0.5 for m in cm.margins.values())
+
+
+def test_budget_fraction_and_margins():
+    margins = {"LUT": 0.125, "DSP": 0.2}
+    budget = get_vu13p_budget({"DSP": 0.01, "LUT": 0.01, "FF": 0.01, "BRAM_bits": 0.01}, margins=margins)
+    assert budget["LUT"] == pytest.approx(0.01 * VU13P_LIMITS["LUT"] / 1.125)
+    assert budget["DSP"] == pytest.approx(0.01 * VU13P_LIMITS["DSP"] / 1.2)
+    assert budget["FF"] == pytest.approx(0.01 * VU13P_LIMITS["FF"])
+
+
+def _seeded_fp32_model(seed: int = 0):
+    import tf_keras
+    tf_keras.utils.set_random_seed(seed)
+    return build_compact_cnn1d_fp32(input_dim=25, num_filters=8, kernel_size=3, dense_units=8)
+
+
+def test_calibrated_costs_of_a_model():
+    """Weights are constants in the logic: one RAMB18 (sigmoid), no DSP up to 8 bits, fewer LUTs
+    with fewer weight bits, and the per-layer costs add up to the total."""
+    model = _seeded_fp32_model()
+    w8 = {name: 8 for name in LAYERS}
+    w4 = {name: 4 for name in LAYERS}
+    hw8 = compute_model_hardware_costs(model, weights_bits=w8, act_bits=8, input_dim=25)
+    hw4 = compute_model_hardware_costs(model, weights_bits=w4, act_bits=8, input_dim=25)
+
+    assert hw8["vu13p_resources"]["BRAM_bits"] == RAMB18_BITS
+    assert hw8["vu13p_resources"]["DSP"] == 0.0
+    assert hw4["vu13p_resources"]["LUT"] < hw8["vu13p_resources"]["LUT"]
+    assert sum(row["LUT"] for row in hw8["breakdown"]) == pytest.approx(hw8["vu13p_resources"]["LUT"])
+    assert sum(row["FF"] for row in hw8["breakdown"]) + get_cost_model().gamma_ff == pytest.approx(
+        hw8["vu13p_resources"]["FF"]
+    )
+
+
+def test_cost_fn_matches_calibrated_resources():
+    model = _seeded_fp32_model()
+    cost_fn = make_cost_fn(model, input_bits=8)
+    for w_bits, act_bits in [
+        ({"conv1d_1": 3, "dense_1": 5, "output_dense": 8}, {"conv1d_1": 8, "dense_1": 8}),
+        ({"conv1d_1": 6, "dense_1": 4, "output_dense": 12}, {"conv1d_1": 6, "dense_1": 12}),
+    ]:
+        expected = calibrated_resources(model, w_bits, act_bits, input_bits=8)["total"]
+        got = cost_fn(w_bits, act_bits)
+        for key in ("DSP", "LUT", "FF", "BRAM_bits"):
+            assert got[key] == pytest.approx(expected[key])
+
+
+def test_allocator_returns_the_integer_optimum_of_the_calibrated_model():
+    """With the calibrated cost function the allocation is the best feasible combination of that model."""
+    model = _seeded_fp32_model()
+    cost_fn = make_cost_fn(model, input_bits=8)
+    act = {"conv1d_1": 8, "dense_1": 8}
+    lut_low = cost_fn({n: 2 for n in LAYERS}, act)["LUT"]
+    lut_high = cost_fn({n: 8 for n in LAYERS}, act)["LUT"]
+    budget = {"DSP": 102.0, "LUT": 0.5 * (lut_low + lut_high), "FF": 28000.0, "BRAM_bits": 990904.0}
+
+    opt = LagrangeKKTQuantizerOptimizer(budget)
+    w, _, sol = opt.compute_primal_bit_update(
+        LAYERS, C_TEST, MACS, PARAMS, {n: 8 for n in LAYERS}, act, cost_fn=cost_fn
+    )
+    feasible = [
+        cand for cand in itertools.product(range(2, 9), repeat=3)
+        if all(cost_fn(dict(zip(LAYERS, cand)), act)[k] <= budget[k] + 1e-9 for k in budget)
+    ]
+    chosen = tuple(w[n] for n in LAYERS)
+    assert chosen == min(feasible, key=lambda cand: _omega(C_TEST, cand))
+    assert opt.mu["LUT"] > 0.0
+    assert sol["integer_resources"]["LUT"] <= budget["LUT"]
 
 
 def test_models_forward_pass():

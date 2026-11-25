@@ -75,9 +75,10 @@ def build_compact_qcnn1d(
         act_bits: Global activation bitwidth (int) or per-layer dict {'conv1d_1': a_1, 'dense_1': a_2},
             keyed by the layer whose ReLU output is quantized.
         learning_rate: Adam optimizer learning rate.
-        input_bits: If given, the input rings are quantized with quantized_bits(input_bits, 0, alpha=1)
-            (range [-1, 1), the format the hardware cost model assumes for the first layer).
-            None keeps a floating-point input.
+        input_bits: If given, the input rings are quantized with
+            quantized_bits(input_bits, 0, keep_negative=False, alpha=1): unsigned, range [0, 1),
+            step 2^-input_bits. The L1-normalized rings are non-negative (at most ~0.74), so no
+            sign bit is needed. None keeps a floating-point input.
 
     Returns:
         Compiled QKeras Model ready for Quantization-Aware Training (QAT).
@@ -105,7 +106,10 @@ def build_compact_qcnn1d(
     input_layers = [keras.layers.Input(shape=(input_dim,), name="input_rings")]
     if input_bits is not None:
         input_layers.append(
-            QActivation(quantized_bits(bits=int(input_bits), integer=0, alpha=1), name="input_quant")
+            QActivation(
+                quantized_bits(bits=int(input_bits), integer=0, keep_negative=False, alpha=1),
+                name="input_quant",
+            )
         )
 
     model = keras.Sequential(input_layers + [

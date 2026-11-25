@@ -405,6 +405,7 @@ class LagrangeKKTQuantizerOptimizer:
         b_min: int = 2,
         b_max: int = 8,
         input_bits: int = 8,
+        cost_fn: Optional[Callable[[Dict[str, int], Dict[str, int]], Dict[str, float]]] = None,
     ) -> Tuple[Dict[str, int], Dict[str, int], Dict[str, Any]]:
         """Next weight bits from the Lagrangian of  min sum_l c_l 4^(-w_l)  s.t.  g_j(w) <= 0.
 
@@ -413,14 +414,17 @@ class LagrangeKKTQuantizerOptimizer:
 
         1. With B_DSP = 0, weights and activations are limited to 8 bits (above that the cost model
            maps multiplications to DSP48E2).
-        2. Each constraint g_j(w) = (R_j(w) - B_j) / max(B_j, 1) is written as K_j w + g0_j from the
-           cost model (exact while the cost is linear in w_l, as in estimate_hardware_resources up
-           to 8 bits).
+        2. Each constraint g_j(w) = (R_j(w) - B_j) / max(B_j, 1) is written as K_j w + g0_j, the
+           secant of the cost model between b_min and b_max for each layer (exact when the cost is
+           linear in w_l, an approximation for the calibrated model).
         3. The relaxed problem is solved by dual ascent (solve_relaxed_dual); the shadow prices of
            the solution are stored in ``self.mu``.
         4. The integer bits are the exact optimum over all combinations in [b_min, b_max], checked
            against the cost model itself.
 
+        ``cost_fn(weights_bits, act_bits) -> {resource: usage}`` is the cost model; use
+        src.hardware.make_cost_fn(reference_model, input_bits) for the calibrated VU13P model.
+        When omitted, the analytical estimate_hardware_resources is used with ``input_bits``.
         ``current_w`` is not needed by this step and is kept for the call signature.
 
         Returns:
@@ -434,6 +438,8 @@ class LagrangeKKTQuantizerOptimizer:
         c = np.asarray(c_coeffs, dtype=np.float64)
 
         def resources(w_bits) -> Dict[str, float]:
+            if cost_fn is not None:
+                return cost_fn(dict(zip(layer_names, (int(w) for w in w_bits))), next_a)
             return estimate_hardware_resources([
                 {"w_bits": int(w), "a_bits": a_in[name], "params": float(p), "macc": float(m)}
                 for name, w, p, m in zip(layer_names, w_bits, params_list, macs_list)

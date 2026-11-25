@@ -10,6 +10,8 @@ import tf_keras as keras
 
 from src.exporter import ArtifactExporter, export_csvs_for_existing_regions
 from src.hardware import (
+    RAMB18_BITS,
+    calibrated_resources,
     compute_model_hardware_costs,
     estimate_vu13p_detailed_resources,
     extract_qtools_hardware_profile,
@@ -278,8 +280,8 @@ def test_qtools_vu13p_detailed_estimator():
 
     hw = compute_model_hardware_costs(qmodel, weights_bits=w_bits, act_bits=a_bits, input_dim=25)
     assert hw["vu13p_resources"]["DSP"] == 0.0
-    assert abs(hw["vu13p_resources"]["LUT"] - 2268.444) < 0.1
-    assert hw["vu13p_resources"]["BRAM_bits"] == 4016.0
+    assert hw["vu13p_resources"]["LUT"] == pytest.approx(calibrated_resources(qmodel, w_bits, a_bits)["total"]["LUT"])
+    assert hw["vu13p_resources"]["BRAM_bits"] == RAMB18_BITS
     assert hw["total_energy_pj"] == q_prof["total_energy_pj"]
     assert hw["breakdown"][0]["acc_bits"] == 12
     assert hw["breakdown"][1]["acc_bits"] == 20
