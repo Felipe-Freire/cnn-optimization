@@ -84,10 +84,11 @@ A resolução implementada em [`src/kkt_allocator.py`](file:///home/iaraujo/Docu
 1. **Sensibilidade de Curvatura via Algoritmo de Hutchinson ($\operatorname{Tr}(\mathbf{H}_l)$ e $c_l$)**:
    - [`compute_hutchinson_hessian_trace`](file:///home/iaraujo/Documentos/Github/cnn-optimization/src/kkt_allocator.py#L8-L60) estima o traço total da Hessiana de cada camada usando produtos Hessiana-vetor (HVP) com vetores de Rademacher $\mathbf{z} \in \{-1, +1\}^{P_l}$, sorteados camada a camada, e [`compute_layer_c_coefficients`](file:///home/iaraujo/Documentos/Github/cnn-optimization/src/kkt_allocator.py#L63-L85) computa $c_l = \operatorname{Tr}(\mathbf{H}_l) \, \kappa^2 / 24$, com $\kappa = 2^{I+1} = 8$ a largura da faixa do quantizador de pesos.
 2. **Passo Dual (Preços de Sombra $\mu_j$ na VU13P)**:
-   - [`LagrangeKKTQuantizerOptimizer`](file:///home/iaraujo/Documentos/Github/cnn-optimization/src/kkt_allocator.py#L232-L402) calcula as violações normalizadas $\tilde{g}_j(\mathbf{x}^{(t)}) = (R_j(\mathbf{x}^{(t)}) - B_j)/\max(B_j, 1)$ e atualiza os preços de sombra $\mu_j^{(t+1)}$ via subgradiente dual com projeção de folga complementar.
-3. **Passo Primal (*Water-Filling* Analítico KKT)**:
-   - Quando $\mu_{\text{DSP}} > 0$, impõe $w_l, a_l \le 8\text{ bits}$ (zerando o uso de `DSP48E2`). Quando $\mu_{\text{LUT}} > 0$ ou $\mu_{\text{BRAM}} > 0$, resolve analiticamente a condição de estacionaridade KKT em [`solve_kkt_bit_allocation()`](file:///home/iaraujo/Documentos/Github/cnn-optimization/src/kkt_allocator.py#L88-L188):
-     $$w_l^*(\lambda) = \operatorname{clip}\!\left( \frac{1}{2} \log_2\!\left( \frac{c_l \ln 4}{\lambda \cdot \text{MAC}_l \cdot a_l} \right), \, b_{\min}, \, b_{\max} \right)$$
+   - [`LagrangeKKTQuantizerOptimizer`](file:///home/iaraujo/Documentos/Github/cnn-optimization/src/kkt_allocator.py#L232-L402) calcula as violações normalizadas $\tilde{g}_j(\mathbf{x}^{(t)}) = (R_j(\mathbf{x}^{(t)}) - B_j)/\max(B_j, 1)$ e atualiza os preços de sombra por subgradiente projetado, $\mu_j \leftarrow \max(0, \mu_j + \eta_\mu \tilde{g}_j)$.
+3. **Passo Primal (*Water-Filling* KKT com preços de sombra)**:
+   - Com $B_{\text{DSP}} = 0$, limita $w_l, a_l \le 8\text{ bits}$ (sem `DSP48E2`). Para os preços $\mu_j$, cada bit de peso da camada $l$ custa $\pi_l = \sum_j \mu_j \, \frac{\partial R_j/\partial w_l}{B_j}$ e a condição de estacionaridade dá:
+     $$w_l(\boldsymbol{\mu}) = \operatorname{clip}\!\left( \frac{1}{2} \log_2\!\left( \frac{c_l \ln 4}{\pi_l} \right), \, b_{\min}, \, b_{\max} \right)$$
+   - Os preços são ajustados por ascensão dual até a solução contínua satisfazer as condições KKT ([`solve_relaxed_dual`](file:///home/iaraujo/Documentos/Github/cnn-optimization/src/kkt_allocator.py)); os bits inteiros são o ótimo exato da enumeração no modelo de custo.
    - Converge na **Iteração #5** com `w = {'conv1d_1': 2, 'dense_1': 5, 'output_dense': 8}` e `a = {'conv1d_1': 8, 'dense_1': 8}`.
 
 ---

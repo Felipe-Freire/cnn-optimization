@@ -1,5 +1,6 @@
 """Unit tests for core optimization and modeling modules."""
 
+import itertools
 import os
 os.environ["TF_USE_LEGACY_KERAS"] = "1"
 import numpy as np
@@ -177,6 +178,93 @@ def test_primal_update_costs_weight_bits_with_the_input_precision():
     assert used["LUT"] <= 2500.0
 
 
+BUDGET_LUT_BINDING = {"DSP": 0.0, "LUT": 2500.0, "FF": 10000.0, "BRAM_bits": 5500.0}
+C_TEST = [0.4, 1.3, 0.01]
+
+
+def _omega(c, w):
+    return float(np.sum(np.asarray(c) * 4.0 ** (-np.asarray(w, dtype=float))))
+
+
+def _resources(w_bits, a_in_bits=(8, 8, 8)):
+    return estimate_hardware_resources([
+        {"w_bits": w, "a_bits": a, "params": p, "macc": m}
+        for w, a, p, m in zip(w_bits, a_in_bits, PARAMS, MACS)
+    ])
+
+
+def test_primal_step_matches_water_filling_when_only_lut_binds():
+    """With one binding resource the prices reduce to the single-budget water-filling:
+    same continuous bits, and mu_LUT = lambda * 18 * B_LUT; resources with slack get price 0."""
+    opt = LagrangeKKTQuantizerOptimizer(dict(BUDGET_LUT_BINDING))
+    _, _, sol = opt.compute_primal_bit_update(
+        LAYERS, C_TEST, MACS, PARAMS, {n: 8 for n in LAYERS}, {"conv1d_1": 8, "dense_1": 8}
+    )
+    ref = solve_kkt_bit_allocation(LAYERS, C_TEST, [m * 8 for m in MACS], budget_bops=2500.0 * 18)
+
+    for name in LAYERS:
+        assert sol["continuous_bits"][name] == pytest.approx(ref["continuous_bits"][name], abs=1e-4)
+    assert opt.mu["LUT"] == pytest.approx(ref["lambda_optimal"] * 18 * 2500.0, rel=1e-3)
+    assert opt.mu["FF"] == pytest.approx(0.0, abs=1e-9)
+    assert opt.mu["BRAM_bits"] == pytest.approx(0.0, abs=1e-9)
+    assert sol["g_continuous"]["LUT"] == pytest.approx(0.0, abs=1e-5)
+
+
+def test_primal_step_satisfies_kkt_with_two_binding_resources():
+    """LUT and BRAM both bind: stationarity, feasibility, complementary slackness and weak duality."""
+    opt = LagrangeKKTQuantizerOptimizer({**BUDGET_LUT_BINDING, "BRAM_bits": 3200.0})
+    _, _, sol = opt.compute_primal_bit_update(
+        LAYERS, C_TEST, MACS, PARAMS, {n: 8 for n in LAYERS}, {"conv1d_1": 8, "dense_1": 8}
+    )
+    assert sol["dual_converged"]
+    assert sol["stationarity_residual"] < 1e-9
+    assert max(sol["g_continuous"].values()) < 1e-5
+    assert sol["complementary_slackness"] < 1e-5
+    assert opt.mu["LUT"] > 0.0 and opt.mu["BRAM_bits"] > 0.0
+    assert sol["omega_integer"] >= sol["dual_bound"] - 1e-12
+
+
+def test_primal_step_returns_the_integer_optimum():
+    """The integer bits are the best feasible combination under the cost model (BRAM binding)."""
+    budget = {**BUDGET_LUT_BINDING, "BRAM_bits": 3200.0}
+    opt = LagrangeKKTQuantizerOptimizer(budget)
+    w, _, _ = opt.compute_primal_bit_update(
+        LAYERS, C_TEST, MACS, PARAMS, {n: 8 for n in LAYERS}, {"conv1d_1": 8, "dense_1": 8}
+    )
+    feasible = [
+        cand for cand in itertools.product(range(2, 9), repeat=3)
+        if all(_resources(cand)[k] <= budget[k] + 1e-9 for k in budget)
+    ]
+    chosen = tuple(w[n] for n in LAYERS)
+    assert chosen in feasible
+    assert chosen == min(feasible, key=lambda cand: _omega(C_TEST, cand))
+
+
+def test_stopping_rule_rejects_a_configuration_without_stationarity():
+    """A frozen configuration (2 bits everywhere, SP = 0.5) that did not come from the Lagrangian
+    minimization is never certified, even after its prices settle."""
+    res = _resources((2, 2, 2), a_in_bits=(8, 2, 2))
+    opt = LagrangeKKTQuantizerOptimizer(dict(BUDGET_LUT_BINDING), lr_mu=0.8)
+    opt.mu = {"DSP": 4.6, "LUT": 0.766, "FF": 0.089, "BRAM_bits": 1.252}
+    sp_history = []
+    for _ in range(30):
+        sp_history.append(0.5)
+        _, g = opt.lagrangian_penalty(0.5, res)
+        opt.update_multipliers(g)
+        converged, diag = check_kkt_stopping_criteria(sp_history, g, opt.mu, tol_sp=1e-3, tol_kkt=2e-2, window=2)
+        assert not converged
+    assert not diag["stationary"]
+
+
+def test_lagrangian_counts_slack_constraints():
+    """L(x, mu) = (1 - SP) + sum_j mu_j g_j: a priced constraint with slack lowers L."""
+    opt = LagrangeKKTQuantizerOptimizer({"LUT": 1000.0})
+    opt.mu = {"LUT": 0.5}
+    cost, g = opt.lagrangian_penalty(0.1, {"LUT": 800.0})
+    assert g["LUT"] == pytest.approx(-0.2)
+    assert cost == pytest.approx(0.1 - 0.5 * 0.2)
+
+
 def test_models_forward_pass():
     dummy_x = np.random.randn(4, 50).astype(np.float32)
 
@@ -241,31 +329,42 @@ def test_vu13p_estimator_and_primal_dual_kkt(tmp_path):
     assert not diag1["primal_feasible"]
     opt.record_step(1, 0.960, {"conv1d_1": 16}, {"conv1d_1": 16}, res_high, g1, cost1, diag1)
 
-    # Subsequent feasible steps where multipliers decay to 0 and SP stabilizes
-    for step in range(2, 7):
-        sp_val = 0.9650
-        sp_hist.append(sp_val)
-        cost_t, g_t = opt.lagrangian_penalty(1.0 - sp_val, res_low)
+    # Projected subgradient: a constraint with slack lowers its price by lr_mu * g, never below 0
+    mu_before = dict(opt.mu)
+    _, g_low = opt.lagrangian_penalty(1.0 - 0.965, res_low)
+    opt.update_multipliers(g_low)
+    for k in opt.mu:
+        assert opt.mu[k] == pytest.approx(max(0.0, mu_before[k] + 0.5 * g_low[k]))
+
+    # Closed loop: every configuration comes from compute_primal_bit_update, which reports the
+    # stationarity residual the stopping rule requires
+    c_coeffs = [0.05, 1.5, 0.2]
+    w_cfg, a_cfg, sol = opt.compute_primal_bit_update(
+        LAYERS, c_coeffs, MACS, PARAMS, {n: 16 for n in LAYERS}, {"conv1d_1": 16, "dense_1": 16}
+    )
+    assert all(2 <= v <= 8 for v in w_cfg.values()) and all(v <= 8 for v in a_cfg.values())
+    assert w_cfg["dense_1"] >= w_cfg["conv1d_1"]
+
+    for step in range(2, 8):
+        sp_hist.append(0.965)
+        a_in = layer_input_bits(LAYERS, a_cfg, input_bits=8)
+        res_t = estimate_hardware_resources([
+            {"w_bits": w_cfg[n], "a_bits": a_in[n], "params": p, "macc": m}
+            for n, m, p in zip(LAYERS, MACS, PARAMS)
+        ])
+        cost_t, g_t = opt.lagrangian_penalty(1.0 - 0.965, res_t)
         opt.update_multipliers(g_t)
-        conv_t, diag_t = check_kkt_stopping_criteria(sp_hist, g_t, opt.mu, tol_sp=1e-3, tol_kkt=1e-2, window=2)
-        opt.record_step(step, sp_val, {"conv1d_1": 4}, {"conv1d_1": 8}, res_low, g_t, cost_t, diag_t)
+        conv_t, diag_t = check_kkt_stopping_criteria(
+            sp_hist, g_t, opt.mu, tol_sp=1e-3, tol_kkt=1e-2, window=2,
+            stationarity_residual=sol["stationarity_residual"],
+        )
+        opt.record_step(step, 0.965, w_cfg, a_cfg, res_t, g_t, cost_t, diag_t)
+        if conv_t:
+            break
+        w_cfg, a_cfg, sol = opt.compute_primal_bit_update(LAYERS, c_coeffs, MACS, PARAMS, w_cfg, a_cfg)
 
     assert conv_t
-    assert diag_t["primal_feasible"]
-    assert diag_t["complementary_slackness"]
+    assert diag_t["stationary"] and diag_t["primal_feasible"] and diag_t["complementary_slackness"]
 
     plot_path = plot_primal_dual_kkt_evolution(opt.history, save_path=str(tmp_path / "kkt_evo.png"))
     assert os.path.isfile(plot_path) and os.path.getsize(plot_path) > 0
-
-    # Test compute_primal_bit_update driven by shadow prices
-    opt.mu = {"DSP": 8.0, "LUT": 0.8, "FF": 0.0, "BRAM_bits": 0.4}
-    next_w, next_a, _ = opt.compute_primal_bit_update(
-        layer_names=["conv1d_1", "dense_1", "output_dense"],
-        c_coeffs=[0.05, 1.5, 0.2],
-        macs_list=[600.0, 768.0, 8.0],
-        params_list=[32.0, 776.0, 9.0],
-        current_w={"conv1d_1": 8, "dense_1": 8, "output_dense": 8},
-        current_a={"conv1d_1": 8, "dense_1": 8},
-    )
-    assert all(2 <= v <= 8 for v in next_w.values())
-    assert next_w["dense_1"] >= next_w["conv1d_1"]

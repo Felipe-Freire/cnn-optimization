@@ -1,11 +1,12 @@
 """Mixed-precision bit allocation via Hessian sensitivity and Karush-Kuhn-Tucker (KKT) on VU13P."""
 
+import itertools
 import warnings
 from typing import Any, Callable, Dict, List, Optional, Tuple
 import numpy as np
 import tensorflow as tf
 
-from src.hardware import layer_input_bits
+from src.hardware import estimate_hardware_resources, layer_input_bits
 from src.models import QUANTIZER_INTEGER_BITS
 
 MIN_TRACE = 1e-8
@@ -214,14 +215,20 @@ def check_kkt_stopping_criteria(
     tol_sp: float = 1e-4,
     tol_kkt: float = 1e-3,
     window: int = 3,
+    stationarity_residual: Optional[float] = None,
+    tol_stat: float = 1e-6,
 ) -> Tuple[bool, Dict[str, Any]]:
-    """Checks KKT convergence criteria: SP stabilization, Primal Feasibility, and Complementary Slackness.
+    """Checks KKT convergence criteria: SP stabilization, stationarity, feasibility and complementary slackness.
 
     Conditions at optimal point (x*, mu*):
     1. SP-Index Stabilization: |SP[-1] - mean(SP[-window-1:-1])| < tol_sp
-    2. Primal Feasibility: g_j(x*) <= 0 for all j in {'DSP', 'LUT', 'FF', 'BRAM_bits'}
-    3. Dual Feasibility: mu_j* >= 0 for all j
-    4. Complementary Slackness: |mu_j* * g_j(x*)| < tol_kkt for all j
+    2. Stationarity: x* minimizes the Lagrangian for mu*. ``stationarity_residual`` is the residual
+       of dL/db reported by compute_primal_bit_update for the current configuration; a
+       configuration that did not come from that minimization has no residual (None) and is
+       never certified.
+    3. Primal Feasibility: g_j(x*) <= 0 for all j in {'DSP', 'LUT', 'FF', 'BRAM_bits'}
+    4. Dual Feasibility: mu_j* >= 0 for all j
+    5. Complementary Slackness: |mu_j* * g_j(x*)| < tol_kkt for all j
     """
     sp_converged = False
     sp_change = 1.0
@@ -230,22 +237,97 @@ def check_kkt_stopping_criteria(
         if sp_change < tol_sp:
             sp_converged = True
 
+    stationary = stationarity_residual is not None and float(stationarity_residual) <= tol_stat
     primal_feasible = all(float(g) <= 1e-9 for g in g_val.values())
     dual_feasible = all(float(m) >= -1e-12 for m in mu.values())
     slackness_products = {k: float(abs(mu[k] * g_val[k])) for k in mu.keys()}
     complementary_slackness = all(val < tol_kkt for val in slackness_products.values())
 
-    converged = bool(sp_converged and primal_feasible and dual_feasible and complementary_slackness)
+    converged = bool(
+        sp_converged and stationary and primal_feasible and dual_feasible and complementary_slackness
+    )
     diagnostics = {
         "converged": converged,
         "sp_converged": sp_converged,
         "sp_change": sp_change,
+        "stationary": stationary,
+        "stationarity_residual": None if stationarity_residual is None else float(stationarity_residual),
         "primal_feasible": primal_feasible,
         "dual_feasible": dual_feasible,
         "complementary_slackness": complementary_slackness,
         "slackness_products": slackness_products,
     }
     return converged, diagnostics
+
+
+def solve_relaxed_dual(
+    c: np.ndarray,
+    K: np.ndarray,
+    g0: np.ndarray,
+    b_min: float,
+    b_max: float,
+    mu0: float = 1e-3,
+    tol: float = 1e-6,
+    max_iter: int = 2000,
+) -> Dict[str, Any]:
+    """Lagrangian dual of  min_b sum_l c_l 4^(-b_l)  s.t.  K b + g0 <= 0,  b_min <= b_l <= b_max.
+
+    Row j of (K, g0) is the normalized constraint g_j(b) = (R_j(b) - B_j) / max(B_j, 1), linear in b.
+    For fixed prices mu >= 0 the Lagrangian separates by layer and its minimizer is the water-filling
+
+        b_l(mu) = clip( 1/2 * log2( c_l ln4 / pi_l ), b_min, b_max ),   pi_l = sum_j mu_j K_jl,
+
+    so stationarity holds by construction. The primal is strictly convex, so the dual function is
+    concave and differentiable with gradient g(b(mu)); mu is moved by projected ascent in
+    t_j = log2(mu_j), which keeps mu_j >= 0 and changes it by a constant factor per unit of
+    violation. It stops when b(mu) is feasible and complementary slackness holds (relative to the
+    objective): the four KKT conditions, which are sufficient here.
+    """
+    c = np.asarray(c, dtype=np.float64)
+    if np.any(K @ np.full(c.size, float(b_min)) + g0 > 0):
+        raise ValueError("Infeasible budget: violated even with every layer at b_min.")
+    mu = np.full(len(g0), float(mu0))
+    eta = 1.0 / max(float(K.sum(axis=1).max()), 1e-12) if len(g0) else 0.0
+    converged = False
+    for iteration in range(1, max_iter + 1):
+        price = mu @ K if len(g0) else np.zeros_like(c)
+        b = np.clip(0.5 * np.log2(c * np.log(4.0) / np.maximum(price, 1e-300)), b_min, b_max)
+        g = K @ b + g0 if len(g0) else np.zeros(0)
+        omega = float(np.sum(c * 4.0 ** (-b)))
+        if not len(g0) or (g.max() < tol and np.max(np.abs(mu * g)) < tol * omega):
+            converged = True
+            break
+        mu = mu * 2.0 ** (2.0 * eta * np.clip(g, -2.0, 2.0))
+
+    # Prices of constraints with slack only decay geometrically; complementary slackness sets them
+    # to zero, and the minimizer is recomputed with the remaining prices.
+    if len(g0) and np.any(g < -tol):
+        mu = np.where(g < -tol, 0.0, mu)
+        price = mu @ K
+        b = np.clip(0.5 * np.log2(c * np.log(4.0) / np.maximum(price, 1e-300)), b_min, b_max)
+        g = K @ b + g0
+        omega = float(np.sum(c * 4.0 ** (-b)))
+
+    # dL/db_l: zero in the interior, >= 0 at b_min (nu_lower) and <= 0 at b_max (nu_upper)
+    grad = -c * np.log(4.0) * 4.0 ** (-b) + (mu @ K if len(g0) else 0.0)
+    at_min, at_max = b <= b_min + 1e-12, b >= b_max - 1e-12
+    interior = ~(at_min | at_max)
+    residual = max(
+        float(np.max(np.abs(grad[interior]), initial=0.0)),
+        float(np.max(-grad[at_min], initial=0.0)),
+        float(np.max(grad[at_max], initial=0.0)),
+    )
+    return {
+        "bits": b,
+        "mu": mu,
+        "g": g,
+        "omega": omega,
+        "dual_value": omega + float(mu @ g) if len(g0) else omega,
+        "stationarity_residual": residual,
+        "complementary_slackness": float(np.max(np.abs(mu * g), initial=0.0)),
+        "iterations": iteration,
+        "converged": converged,
+    }
 
 
 class LagrangeKKTQuantizerOptimizer:
@@ -264,13 +346,11 @@ class LagrangeKKTQuantizerOptimizer:
         lr_x: float = 0.05,
         lr_mu: float = 0.50,
         normalize_constraints: bool = True,
-        slack_decay: float = 0.30,
     ):
         self.limits = {k: float(v) for k, v in hardware_limits.items()}
         self.lr_x = lr_x
         self.lr_mu = lr_mu
         self.normalize_constraints = normalize_constraints
-        self.slack_decay = slack_decay
 
         # Dual variables (shadow prices) mu_j >= 0
         self.mu: Dict[str, float] = {k: 0.0 for k in self.limits.keys()}
@@ -293,31 +373,25 @@ class LagrangeKKTQuantizerOptimizer:
     def lagrangian_penalty(
         self, sp_loss: float, resource_usage: Dict[str, float]
     ) -> Tuple[float, Dict[str, float]]:
-        """Computes the penalized Lagrangian cost L(x, mu) = (1 - SP) + sum_j mu_j * max(0, g_j(x))."""
+        """Computes the Lagrangian L(x, mu) = (1 - SP) + sum_j mu_j * g_j(x)."""
         g_raw, g_norm = self.evaluate_constraints(resource_usage)
         g_used = g_norm if self.normalize_constraints else g_raw
 
         penalty = 0.0
         for k in self.limits.keys():
-            penalty += self.mu[k] * max(0.0, g_used[k])
+            penalty += self.mu[k] * g_used[k]
 
         total_cost = float(sp_loss + penalty)
         return total_cost, g_used
 
     def update_multipliers(self, g_val: Dict[str, float]) -> Dict[str, float]:
-        """Dual update via projected subgradient ascent + complementary slackness projection.
+        """Projected subgradient ascent on the dual: mu_j <- max(0, mu_j + lr_mu * g_j(x)).
 
-        - If g_j(x) > 0 (resource limit violated): increases shadow price mu_j^{(t+1)} = mu_j^{(t)} + lr_mu * g_j.
-        - If g_j(x) <= 0 (resource feasible with slack): decays mu_j toward 0 so that
-          complementary slackness (mu_j* * g_j(x*) = 0) is strictly satisfied for inactive constraints.
+        A constraint with slack (g_j < 0) lowers its price and reaches mu_j = 0 only through this
+        projection, which is how complementary slackness mu_j * g_j = 0 arises at the optimum.
         """
         for k in self.mu.keys():
-            gv = float(g_val[k])
-            if gv > 0.0:
-                self.mu[k] = float(self.mu[k] + self.lr_mu * gv)
-            else:
-                updated = self.mu[k] + self.lr_mu * gv
-                self.mu[k] = float(max(0.0, min(updated, self.mu[k] * self.slack_decay)))
+            self.mu[k] = float(max(0.0, self.mu[k] + self.lr_mu * float(g_val[k])))
         return self.mu.copy()
 
     def compute_primal_bit_update(
@@ -332,71 +406,95 @@ class LagrangeKKTQuantizerOptimizer:
         b_max: int = 8,
         input_bits: int = 8,
     ) -> Tuple[Dict[str, int], Dict[str, int], Dict[str, Any]]:
-        """Computes the next primal configuration (w_l^{(t+1)}, a_l^{(t+1)}) from current shadow prices mu_j.
+        """Next weight bits from the Lagrangian of  min sum_l c_l 4^(-w_l)  s.t.  g_j(w) <= 0.
 
         ``current_a`` is keyed by the layer whose ReLU output is quantized; the cost of a weight bit
-        of layer l is MAC_l * a_in,l, with a_in,l the precision entering l (layer_input_bits).
+        of layer l uses the precision entering l (layer_input_bits). Steps:
 
-        Follows KKT stationarity on the VU13P:
-        1. If mu_DSP > 0 or B_DSP == 0: enforces sub-byte arithmetic (w_l <= 8, a_l <= 8) so DSP = 0.
-        2. If mu_LUT > 0 or mu_BRAM > 0: computes the effective BOPs/LUT budget from B_LUT and B_BRAM
-           and solves the analytical KKT water-filling problem weighted by layer sensitivities c_l.
-        3. Adapts activation bitwidths a_l on high-MAC layers when LUT pressure remains active.
+        1. With B_DSP = 0, weights and activations are limited to 8 bits (above that the cost model
+           maps multiplications to DSP48E2).
+        2. Each constraint g_j(w) = (R_j(w) - B_j) / max(B_j, 1) is written as K_j w + g0_j from the
+           cost model (exact while the cost is linear in w_l, as in estimate_hardware_resources up
+           to 8 bits).
+        3. The relaxed problem is solved by dual ascent (solve_relaxed_dual); the shadow prices of
+           the solution are stored in ``self.mu``.
+        4. The integer bits are the exact optimum over all combinations in [b_min, b_max], checked
+           against the cost model itself.
+
+        ``current_w`` is not needed by this step and is kept for the call signature.
+
+        Returns:
+            (next weight bits, activation bits used, diagnostics with the continuous solution,
+            shadow prices, KKT residuals, dual bound and integer optimum).
         """
-        # 1. Enforce DSP constraint (UltraScale+ uses DSP48E2 when w_l > 8 or a_l > 8)
-        eff_b_max = b_max if (self.mu.get("DSP", 0.0) > 0.0 or self.limits.get("DSP", 0.0) <= 0.0) else 16
+        dsp_forbidden = self.limits.get("DSP", 0.0) <= 0.0
+        w_max = min(b_max, 8) if dsp_forbidden else b_max
+        next_a = {k: (min(int(v), 8) if dsp_forbidden else int(v)) for k, v in current_a.items()}
+        a_in = layer_input_bits(layer_names, next_a, input_bits)
+        c = np.asarray(c_coeffs, dtype=np.float64)
 
-        # 2. Check if all constraints are already feasible and only DSP was violated at 16-bit
-        lut_pressure = self.mu.get("LUT", 0.0)
-        bram_pressure = self.mu.get("BRAM_bits", 0.0)
-        ff_pressure = self.mu.get("FF", 0.0)
+        def resources(w_bits) -> Dict[str, float]:
+            return estimate_hardware_resources([
+                {"w_bits": int(w), "a_bits": a_in[name], "params": float(p), "macc": float(m)}
+                for name, w, p, m in zip(layer_names, w_bits, params_list, macs_list)
+            ])
 
-        # If no LUT/BRAM multiplier is active yet (e.g., right after 16-bit DSP violation),
-        # step down to uniform 8-bit first so the dual loop can measure pure LUT/BRAM pressure.
-        if lut_pressure <= 1e-9 and any(v > 8 for v in current_w.values()):
-            next_w = {name: eff_b_max for name in layer_names}
-            next_a = {name: eff_b_max for name in current_a.keys()}
-            return next_w, next_a, {"regime": "sub_byte_8bit_projection"}
+        names = list(self.limits.keys())
+        scale = np.array([max(self.limits[r], 1.0) for r in names])
+        budget = np.array([self.limits[r] for r in names])
+        base = resources([b_min] * len(layer_names))
+        slopes = np.zeros((len(names), len(layer_names)))
+        for l in range(len(layer_names)):
+            w = [b_min] * len(layer_names)
+            w[l] = w_max
+            top = resources(w)
+            for j, r in enumerate(names):
+                slopes[j, l] = (top[r] - base[r]) / max(w_max - b_min, 1)
+        K = slopes / scale[:, None]
+        g0 = (np.array([base[r] for r in names]) - slopes.sum(axis=1) * b_min - budget) / scale
 
-        # 3. When LUT or BRAM shadow prices are active, solve KKT water-filling under VU13P LUT/BRAM ceiling
-        a_in = layer_input_bits(layer_names, current_a, input_bits)
-        a_bits_vec = np.array([float(a_in[name]) for name in layer_names], dtype=np.float64)
-        macs_vec = np.array(macs_list, dtype=np.float64)
-        a_costs = (macs_vec * a_bits_vec).tolist()
+        # constraints that do not depend on w are either always satisfied (price 0) or infeasible
+        varies = np.any(np.abs(K) > 0.0, axis=1)
+        if np.any(~varies & (g0 > 1e-12)):
+            bad = [r for r, v, g in zip(names, varies, g0) if not v and g > 1e-12]
+            raise ValueError(f"Infeasible budget for {bad}: not reachable by changing weight bits.")
+        rows = [j for j in range(len(names)) if varies[j]]
+        dual = solve_relaxed_dual(c, K[rows], g0[rows], b_min, w_max)
+        self.mu = {r: 0.0 for r in names}
+        for j, m in zip(rows, dual["mu"]):
+            self.mu[names[j]] = float(m)
 
-        # Target BOPs derived from VU13P LUT budget (since LUT = BOPs / 18 in sub-byte mode)
-        lut_limit = self.limits.get("LUT", 2500.0)
-        bops_from_lut_limit = lut_limit * 18.0
+        def omega(w) -> float:
+            return float(np.sum(c * 4.0 ** (-np.asarray(w, dtype=np.float64))))
 
-        # Tighten effective budget proportionally to accumulated shadow price mu_LUT + mu_BRAM
-        pressure_factor = min(1.0, max(0.58, 1.0 / (1.0 + 0.35 * (lut_pressure + bram_pressure + ff_pressure))))
-        bops_8bit = float(np.sum(macs_vec * 8.0 * 8.0))
-        target_bops = min(bops_from_lut_limit, bops_8bit * pressure_factor)
+        feasible = []
+        for w in itertools.product(range(b_min, w_max + 1), repeat=len(layer_names)):
+            used = resources(w)
+            if all(used[r] <= self.limits[r] + 1e-9 for r in names):
+                feasible.append(w)
+        if not feasible:
+            raise ValueError("No integer bit allocation in [b_min, b_max] satisfies the budget.")
+        w_int = min(feasible, key=omega)
+        g_cont = K @ dual["bits"] + g0
 
-        kkt_sol = solve_kkt_bit_allocation(
-            layer_names=layer_names,
-            c_coeffs=c_coeffs,
-            a_costs=a_costs,
-            budget_bops=target_bops,
-            b_min=b_min,
-            b_max=eff_b_max,
-        )
-        next_w = kkt_sol["integer_bits"]
-
-        # Check resulting LUT usage with current_a; if LUT > lut_limit, quantize dense activation to 6 bits
-        est_bops_with_cur_a = sum(
-            macs_list[i] * next_w[name] * a_in[name]
-            for i, name in enumerate(layer_names)
-        )
-        est_luts = est_bops_with_cur_a / 18.0
-        next_a = dict(current_a)
-        for k in next_a:
-            next_a[k] = min(next_a[k], eff_b_max)
-
-        if est_luts > lut_limit and "dense_1" in next_a:
-            next_a["dense_1"] = 6
-
-        return next_w, next_a, kkt_sol
+        info = {
+            "continuous_bits": {n: float(b) for n, b in zip(layer_names, dual["bits"])},
+            "integer_bits": {n: int(w) for n, w in zip(layer_names, w_int)},
+            "activation_bits": dict(next_a),
+            "activation_input_bits": dict(a_in),
+            "shadow_prices": dict(self.mu),
+            "g_continuous": {r: float(g) for r, g in zip(names, g_cont)},
+            "stationarity_residual": dual["stationarity_residual"],
+            "complementary_slackness": dual["complementary_slackness"],
+            "dual_iterations": int(dual["iterations"]),
+            "dual_converged": bool(dual["converged"]),
+            "dual_bound": float(dual["dual_value"]),
+            "omega_continuous": float(dual["omega"]),
+            "omega_integer": omega(w_int),
+            "duality_gap": omega(w_int) - float(dual["dual_value"]),
+            "integer_resources": {r: float(v) for r, v in resources(w_int).items()},
+        }
+        return info["integer_bits"], next_a, info
 
     def record_step(
         self,

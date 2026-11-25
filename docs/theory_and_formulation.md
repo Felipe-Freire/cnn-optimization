@@ -222,15 +222,19 @@ No ponto sela ótimo $(\mathbf{x}^*, \boldsymbol{\mu}^*)$, as quatro **Condiçõ
 ### 4.4 Algoritmo Iterativo Primal-Dual (Ascensão de Subgradiente Dual) e Critério de Parada
 
 Para resolver o problema sobre o espaço discreto de larguras de bits $(w_l, a_l)$ e hiperparâmetros $n_l$:
-- **Passo Primal ($t$)**: Para $\boldsymbol{\mu}^{(t)}$ fixo, busca-se a configuração $\mathbf{x}^{(t)}$ que minimiza o custo Lagrangeano penalizado:
-  $$\mathcal{L}_{\text{pen}}(\mathbf{x}, \boldsymbol{\mu}^{(t)}) = (1 - SP_{\text{val}}(\mathbf{x})) + \sum_{j \in \mathcal{R}} \mu_j^{(t)} \max\left(0, \tilde{g}_j(\mathbf{x})\right)$$
-  (integrando também a alocação analítica de bits por sensibilidade Hessiana $\Omega(\mathbf{w}) = \sum_l c_l 4^{-w_l}$ ponderada pelos custos ativos $\sum_j \mu_j^{(t)} \frac{\partial g_j}{\partial w_l}$).
-- **Passo Dual ($t \to t+1$)**: Atualizam-se os multiplicadores de Lagrange via ascensão de subgradiente projetada no ortante não-negativo:
-  $$\mu_j^{(t+1)} = \max\left( 0, \, \mu_j^{(t)} + \eta_{\mu} \, \tilde{g}_j(\mathbf{x}^{(t)}) \right), \quad \forall j \in \mathcal{R}$$
-- **Critério de Parada KKT**: O loop primal-dual encerra quando simultaneamente:
+Com as ativações fixas, cada restrição é linear nos bits dos pesos, $\tilde{g}_j(\mathbf{w}) = \sum_l K_{jl} w_l + g_{0,j}$, com $K_{jl} = \frac{\partial R_j / \partial w_l}{B_j}$ calculado pelo próprio modelo de custo (`LUT`: $\text{MAC}_l \, a_{\text{in},l}/18$; `FF` e `BRAM_bits`: $P_l$). O subproblema em $\mathbf{w}$ usa a sensibilidade $\Omega(\mathbf{w}) = \sum_l c_l 4^{-w_l}$ (Seção 3) como substituto de $1 - SP$:
+
+- **Passo Primal**: para $\boldsymbol{\mu}$ fixo, o Lagrangiano $\Omega(\mathbf{w}) + \sum_j \mu_j \tilde{g}_j(\mathbf{w})$ separa por camada e seu minimizador é o *water-filling* com o preço de cada bit da camada:
+  $$w_l(\boldsymbol{\mu}) = \operatorname{clip}\!\left(\frac{1}{2}\log_2 \frac{c_l \ln 4}{\pi_l},\; b_{\min},\; b_{\max}\right), \qquad \pi_l = \sum_{j \in \mathcal{R}} \mu_j K_{jl}$$
+  Com um único recurso ativo isto é a Seção 3.4 com $\lambda a_l = \pi_l$.
+- **Passo Dual**: a função dual é côncava e diferenciável (o primal é estritamente convexo), com gradiente $\tilde{\mathbf{g}}(\mathbf{w}(\boldsymbol{\mu}))$. Os preços sobem quando o recurso estoura e descem quando sobra, por ascensão projetada em $t_j = \log_2 \mu_j$ (mantém $\mu_j \ge 0$), até valerem viabilidade e folga complementar. Esse laço não treina a rede e leva milissegundos.
+- **Solução inteira**: os bits inteiros são o ótimo exato entre todas as combinações em $[b_{\min}, b_{\max}]$ que cabem no orçamento, verificadas no modelo de custo. A diferença $\Omega(\mathbf{w}_{\text{int}}) - q(\boldsymbol{\mu})$ para o valor dual é registrada.
+- **Laço com QAT**: cada configuração proposta é treinada e avaliada (SP e recursos); entre iterações, os preços são atualizados por $\mu_j \leftarrow \max(0, \mu_j + \eta_\mu \tilde{g}_j)$.
+- **Critério de Parada KKT**: o laço encerra quando simultaneamente:
   1. **Convergência do Índice-SP**: $\left| SP^{(t)} - \frac{1}{m}\sum_{k=1}^m SP^{(t-k)} \right| < \epsilon_{\text{SP}}$;
-  2. **Viabilidade Primal Estrita**: $\tilde{g}_j(\mathbf{x}^{(t)}) \le 0, \, \forall j \in \mathcal{R}$;
-  3. **Folga Complementar KKT**: $\left| \mu_j^{(t)} \cdot \tilde{g}_j(\mathbf{x}^{(t)}) \right| < \epsilon_{\text{KKT}}, \, \forall j \in \mathcal{R}$.
+  2. **Estacionaridade**: a configuração é o minimizador do Lagrangiano para os preços atuais (resíduo de $\partial \mathcal{L} / \partial w_l$ abaixo da tolerância);
+  3. **Viabilidade Primal Estrita**: $\tilde{g}_j(\mathbf{x}^{(t)}) \le 0, \, \forall j \in \mathcal{R}$;
+  4. **Folga Complementar KKT**: $\left| \mu_j^{(t)} \cdot \tilde{g}_j(\mathbf{x}^{(t)}) \right| < \epsilon_{\text{KKT}}, \, \forall j \in \mathcal{R}$.
 
 ---
 

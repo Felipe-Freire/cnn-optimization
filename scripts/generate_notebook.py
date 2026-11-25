@@ -267,7 +267,6 @@ kkt_optimizer = LagrangeKKTQuantizerOptimizer(
     lr_x=0.05,
     lr_mu=0.80,
     normalize_constraints=True,
-    slack_decay=0.25,
 )
 
 # Ponto inicial primal (t=1): Alta precisão (16 bits em pesos e ativações)
@@ -331,6 +330,7 @@ for t_step in range(1, MAX_PRIMAL_DUAL_ITERS + 1):
         tol_sp=1e-3,
         tol_kkt=2e-2,
         window=2,
+        stationarity_residual=last_kkt_sol.get("stationarity_residual"),
     )
     kkt_optimizer.record_step(
         iteration=t_step,
