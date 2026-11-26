@@ -217,6 +217,7 @@ def check_kkt_stopping_criteria(
     window: int = 3,
     stationarity_residual: Optional[float] = None,
     tol_stat: float = 1e-6,
+    tol_primal: float = 1e-6,
 ) -> Tuple[bool, Dict[str, Any]]:
     """Checks KKT convergence criteria: SP stabilization, stationarity, feasibility and complementary slackness.
 
@@ -226,7 +227,7 @@ def check_kkt_stopping_criteria(
        of dL/db reported by compute_primal_bit_update for the current configuration; a
        configuration that did not come from that minimization has no residual (None) and is
        never certified.
-    3. Primal Feasibility: g_j(x*) <= 0 for all j in {'DSP', 'LUT', 'FF', 'BRAM_bits'}
+    3. Primal Feasibility: g_j(x*) <= tol_primal for all j in {'DSP', 'LUT', 'FF', 'BRAM_bits'}
     4. Dual Feasibility: mu_j* >= 0 for all j
     5. Complementary Slackness: |mu_j* * g_j(x*)| < tol_kkt for all j
     """
@@ -238,7 +239,7 @@ def check_kkt_stopping_criteria(
             sp_converged = True
 
     stationary = stationarity_residual is not None and float(stationarity_residual) <= tol_stat
-    primal_feasible = all(float(g) <= 1e-9 for g in g_val.values())
+    primal_feasible = all(float(g) <= tol_primal for g in g_val.values())
     dual_feasible = all(float(m) >= -1e-12 for m in mu.values())
     slackness_products = {k: float(abs(mu[k] * g_val[k])) for k in mu.keys()}
     complementary_slackness = all(val < tol_kkt for val in slackness_products.values())

@@ -1,12 +1,12 @@
 {
-  "timestamp": "2026-11-25T21:32:01.059156",
+  "timestamp": "2026-11-26T14:53:59.146142",
   "dataset_prefix": "mc21_13p6TeV.Zee.JF17.2sigma.5M",
   "model_name": "QCNN1D_KKT",
   "iet": 5,
   "ieta": 0,
   "version": 2,
   "seed": 42,
-  "git_commit": "82271d7dc44ad2947c8aa2154d6d59e53521b53d",
+  "git_commit": "0f0b39fe944a6e892654e84afaf6f32bc162d2b8",
   "python_version": "3.12.16",
   "tensorflow_version": "2.20.0",
   "extra_config": {

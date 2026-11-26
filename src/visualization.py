@@ -614,7 +614,7 @@ def plot_primal_dual_kkt_evolution(
     ax1.grid(True, linestyle=":", alpha=0.5)
     lines = l1 + l2
     labels = [l.get_label() for l in lines]
-    ax1.legend(lines, labels, loc="center right")
+    ax1.legend(lines, labels, loc="lower right")
 
     # 2. Evolution of Lagrange Multipliers (Shadow Prices mu_j)
     ax2 = axes[1]
