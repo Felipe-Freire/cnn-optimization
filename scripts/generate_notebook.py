@@ -235,9 +235,9 @@ Para um orçamento de LUT $B$, o subproblema usa a sensibilidade de Hessiana $\O
 $$\min_{\mathbf{w}} \sum_l c_l 4^{-w_l} \quad \text{s.a.} \quad \tilde{g}_j(\mathbf{w}) = \frac{R_j(\mathbf{w}) - B_j}{B_j} \le 0, \qquad R_j \text{ do modelo de custo calibrado}$$
 
 Em cada passo $t$:
-1. **Lagrange/KKT**: para o orçamento $B^{(t)}$, `compute_primal_bit_update` acha os preços-sombra $\mu_j$ por ascensão dual até as condições KKT e devolve o ótimo inteiro;
+1. **Lagrange/KKT (envelope convexo contínuo)**: para o orçamento $B^{(t)}$, `compute_primal_bit_update` constrói o envelope convexo inferior linear por partes $\hat{r}_{jl}(w)$ de cada camada no modelo calibrado, resolve o dual Lagrangiano até as condições KKT exatas (estacionaridade por subdiferencial, viabilidade primal/dual e folga complementar) e projeta a solução contínua $\mathbf{w}^*(\boldsymbol{\mu}^*)$ para inteiros viáveis sob o modelo calibrado real (com `duality_gap >= 0`);
 2. **QKeras**: o candidato é treinado com QAT (*warm-start* do FP32, mesma semente para todos, taxa de aprendizado 3e-4, faixa de cada quantizador de pesos ajustada a max|W| do FP32 e checkpoint de maior SP entre as épocas com `val_loss` ≤ 1,2× a mínima, para não exportar um modelo descalibrado);
-3. **SP e custo**: mede o SP de validação e recalcula os recursos com os pesos treinados. Se o SP se mantém e cabe no teto, o orçamento desce; se não, sobe (bisseção em $\log B$).
+3. **SP e custo**: mede o SP de validação e recalcula os recursos com os pesos treinados. Se o SP se mantém e cabe no teto da instância VU13P, o orçamento desce; se não, sobe (bisseção em $\log B$).
 """))
 
 cells.append(nbf.v4.new_code_cell(r"""# Split de calibração para o laço de alocação
@@ -354,25 +354,36 @@ for t_step in range(1, MAX_BUDGET_STEPS + 1):
     sp_t, res_t = cand["sp_val"], cand["resources"]
     sp_history_kkt.append(sp_t)
 
-    lag_cost_t, g_val_t = kkt_optimizer.lagrangian_penalty(sp_loss=1.0 - sp_t, resource_usage=res_t)
+    # Nível interno (KKT no envelope convexo): Lagrangiano dual q(mu*) e folgas g_hat(w*)
+    # Nível externo (pós-QAT): SP_val e viabilidade real contra o teto da instância VU13P
+    lag_cost_t = float(kkt_sol["dual_bound"])
+    g_kkt_t = kkt_sol["g_continuous"]
     _, kkt_diag_t = check_kkt_stopping_criteria(
         sp_history=sp_history_kkt,
-        g_val=g_val_t,
+        g_val=g_kkt_t,
         mu=kkt_optimizer.mu,
         tol_sp=1e-3,
         tol_kkt=2e-2,
         window=2,
         stationarity_residual=kkt_sol["stationarity_residual"],
     )
+    kkt_diag_t["post_qat_fits_instance"] = bool(fits_instance(res_t))
     kkt_optimizer.record_step(
         iteration=t_step,
         sp_val=sp_t,
         w_bits=w_cfg,
         a_bits=a_cfg,
         resource_usage=res_t,
-        g_val=g_val_t,
+        g_val=g_kkt_t,
         lagrangian_cost=lag_cost_t,
         kkt_diag=kkt_diag_t,
+        extra={
+            "budget_lut": float(budget_lut),
+            "dual_bound": float(kkt_sol["dual_bound"]),
+            "omega_integer": float(kkt_sol["omega_integer"]),
+            "duality_gap": float(kkt_sol["duality_gap"]),
+            "fits_instance": bool(fits_instance(res_t)),
+        },
     )
 
     keeps_sp = sp_t >= SP_TARGET
@@ -386,8 +397,9 @@ for t_step in range(1, MAX_BUDGET_STEPS + 1):
         lut_low = budget_lut
 
     print(
-        f"  [Passo {t_step}] B_LUT={budget_lut:,.0f} | w={list(w_cfg.values())}b | "
-        f"μ_LUT={kkt_optimizer.mu['LUT']:.3g} | KKT resíduo={kkt_sol['stationarity_residual']:.1e} | "
+        f"  [Passo {t_step}] B_LUT={budget_lut:,.0f} | w_cont={[round(v, 2) for v in kkt_sol['continuous_bits'].values()]} -> "
+        f"w={list(w_cfg.values())}b | μ_LUT={kkt_optimizer.mu['LUT']:.3g} | "
+        f"resíduo={kkt_sol['stationarity_residual']:.1e} | gap={kkt_sol['duality_gap']:.2e} | "
         f"SP={sp_t*100:.2f}% | LUT={res_t['LUT']:,.0f}, FF={res_t['FF']:,.0f}, DSP={res_t['DSP']:.0f} | "
         f"{'aceito' if accepted_t else 'rejeitado'}"
     )

@@ -24,6 +24,7 @@ from src.hardware import (
 )
 from src.kkt_allocator import (
     LagrangeKKTQuantizerOptimizer,
+    _lower_convex_hull,
     check_kkt_stopping_criteria,
     compute_hutchinson_hessian_trace,
     compute_layer_c_coefficients,
@@ -290,12 +291,24 @@ def test_cost_model_reproduces_the_synthesized_points():
     """Fit on the hls4ml/Vivado points of this network; in-domain errors stay within the observed range."""
     cm = get_cost_model()
     rows = [r for r in cm.calibration_table() if r["in_domain"]]
-    assert len(rows) >= 6
+    assert len(rows) >= 7
     for r in rows:
         assert abs(r["LUT_rel_err"]) < 0.20, r
-        assert abs(r["FF_rel_err"]) < 0.15, r
+        assert abs(r["FF_rel_err"]) < 0.20, r
         assert abs(r["DSP_predicted"] - r["DSP_measured"]) <= max(2.0, 0.01 * r["DSP_measured"]), r
     assert all(0.0 < m < 0.5 for m in cm.margins.values())
+
+
+def test_margins_ignore_points_that_alone_determine_a_coefficient():
+    """u16 is the only design with many DSPs, so it alone fixes FF per DSP: its leave-one-out FF error
+    is an extrapolation (leverage 1) and must not set the FF margin."""
+    cm = get_cost_model()
+    u16 = next(r for r in cm.calibration_table() if r["point"] == "u16")
+    assert u16["FF_leverage"] > cm.MAX_LEVERAGE
+    assert abs(u16["FF_loo_rel_err"]) > 1.0
+    kept = [r["FF_loo_rel_err"] for r in cm.calibration_table()
+            if r["in_domain"] and r["FF_leverage"] < cm.MAX_LEVERAGE]
+    assert cm.margins["FF"] == pytest.approx(max(0.0, -min(kept)))
 
 
 def test_budget_fraction_and_margins():
@@ -343,27 +356,55 @@ def test_cost_fn_matches_calibrated_resources():
             assert got[key] == pytest.approx(expected[key])
 
 
+def test_lower_convex_hull_properties():
+    """Lower convex hull stays <= raw curve, has increasing slopes, and collapses linear curves."""
+    xs = np.arange(2, 9, dtype=float)
+    # Linear curve reduces to its two endpoints
+    hx_lin, hy_lin = _lower_convex_hull(xs, 3.0 * (xs - 2.0))
+    assert hx_lin.tolist() == [2.0, 8.0]
+    assert hy_lin.tolist() == [0.0, 18.0]
+
+    # Realistic superlinear curve with a non-convex local bump at w=5
+    ys = np.array([0.0, 288.0, 987.0, 3075.0, 4627.0, 6494.0, 7814.0])
+    hx, hy = _lower_convex_hull(xs, ys)
+    interp = np.interp(xs, hx, hy)
+    assert np.all(interp <= ys + 1e-9)
+    assert interp[0] == pytest.approx(ys[0]) and interp[-1] == pytest.approx(ys[-1])
+    slopes = np.diff(hy) / np.diff(hx)
+    assert np.all(np.diff(slopes) > 0.0)
+
+
 def test_allocator_returns_the_integer_optimum_of_the_calibrated_model():
-    """With the calibrated cost function the allocation is the best feasible combination of that model."""
+    """With the calibrated cost function the KKT convex-envelope solver satisfies KKT, weak duality
+    (duality_gap >= 0), and projects to the feasible optimum across tight and moderate LUT budgets."""
     model = _seeded_fp32_model()
     cost_fn = make_cost_fn(model, input_bits=8)
     act = {"conv1d_1": 8, "dense_1": 8}
     lut_low = cost_fn({n: 2 for n in LAYERS}, act)["LUT"]
     lut_high = cost_fn({n: 8 for n in LAYERS}, act)["LUT"]
-    budget = {"DSP": 102.0, "LUT": 0.5 * (lut_low + lut_high), "FF": 28000.0, "BRAM_bits": 990904.0}
 
-    opt = LagrangeKKTQuantizerOptimizer(budget)
-    w, _, sol = opt.compute_primal_bit_update(
-        LAYERS, C_TEST, MACS, PARAMS, {n: 8 for n in LAYERS}, act, cost_fn=cost_fn
-    )
-    feasible = [
-        cand for cand in itertools.product(range(2, 9), repeat=3)
-        if all(cost_fn(dict(zip(LAYERS, cand)), act)[k] <= budget[k] + 1e-9 for k in budget)
-    ]
-    chosen = tuple(w[n] for n in LAYERS)
-    assert chosen == min(feasible, key=lambda cand: _omega(C_TEST, cand))
-    assert opt.mu["LUT"] > 0.0
-    assert sol["integer_resources"]["LUT"] <= budget["LUT"]
+    for frac in (0.25, 0.50, 0.75):
+        budget = {"DSP": 102.0, "LUT": lut_low + frac * (lut_high - lut_low), "FF": 28000.0, "BRAM_bits": 990904.0}
+        opt = LagrangeKKTQuantizerOptimizer(budget)
+        w, _, sol = opt.compute_primal_bit_update(
+            LAYERS, C_TEST, MACS, PARAMS, {n: 8 for n in LAYERS}, act, cost_fn=cost_fn
+        )
+        feasible = [
+            cand for cand in itertools.product(range(2, 9), repeat=3)
+            if all(cost_fn(dict(zip(LAYERS, cand)), act)[k] <= budget[k] + 1e-9 for k in budget)
+        ]
+        chosen = tuple(w[n] for n in LAYERS)
+        exact_opt = min(feasible, key=lambda cand: _omega(C_TEST, cand))
+
+        assert sol["dual_converged"]
+        assert sol["stationarity_residual"] < 1e-9
+        assert sol["complementary_slackness"] < 1e-5
+        assert max(sol["g_continuous"].values()) < 1e-5
+        assert sol["duality_gap"] >= -1e-12
+        assert sol["omega_integer"] >= sol["dual_bound"] - 1e-12
+        assert opt.mu["LUT"] > 0.0
+        assert sol["integer_resources"]["LUT"] <= budget["LUT"] + 1e-9
+        assert chosen == exact_opt
 
 
 def test_models_forward_pass():

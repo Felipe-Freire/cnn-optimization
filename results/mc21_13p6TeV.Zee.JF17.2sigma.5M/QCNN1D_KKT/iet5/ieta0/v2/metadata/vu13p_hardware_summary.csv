@@ -1,12 +1,12 @@
 iet,ieta,version,metric,vu13p_chip_limit,instance_budget_Bj,fp32_usage,kkt_optimal_usage,slack_gj,instance_utilization_pct,chip_utilization_pct,shadow_price_mu_final,feasible
 5,0,v2,DSP,12288.0,102.4,0.0,0.0,-102.4,0.0,0.0,0.0,True
-5,0,v2,LUT,1728000.0,15360.192035522927,22802.71,10602.22,-4757.97,69.02,0.613555,0.122646,True
-5,0,v2,FF,3456000.0,28312.2090107731,8564.01,3793.83,-24518.38,13.4,0.109775,0.0,True
+5,0,v2,LUT,1728000.0,15035.320525521416,22827.19,10242.4,-4792.92,68.12,0.592731,0.129073,True
+5,0,v2,FF,3456000.0,28387.33007483767,8682.7,3890.26,-24497.07,13.7,0.112565,0.0,True
 5,0,v2,BRAM_bits,99090432.0,990904.3200000001,18432.0,18432.0,-972472.32,1.86,0.018601,0.0,True
-5,0,v2,total_bops,,,88064.0,42944.0,,,,,True
+5,0,v2,total_bops,,,88064.0,42816.0,,,,,True
 5,0,v2,total_macs,,,1376.0,1376.0,,,,,True
 5,0,v2,total_params,,,817.0,817.0,,,,,True
-5,0,v2,total_weight_bits,,,6536.0,2560.0,,,,,True
+5,0,v2,total_weight_bits,,,6536.0,2542.0,,,,,True
 5,0,v2,total_energy_core_pj,,,347.0,246.0,,,,,True
 5,0,v2,total_energy_with_io_pj,,,364.0,281.0,,,,,True
 5,0,v2,total_latency_cycles,,,18.0,18.0,,,,,True

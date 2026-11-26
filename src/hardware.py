@@ -208,6 +208,8 @@ class CostModel:
     dsp_min_csd: int = 3
     calibration: List[Dict[str, Any]] = field(default_factory=list)
 
+    MAX_LEVERAGE = 0.9
+
     def layer_resources(self, spec: LayerSpec) -> Dict[str, float]:
         f = layer_features(spec, self.dsp_min_bits, self.dsp_min_csd)
         return {
@@ -232,10 +234,19 @@ class CostModel:
 
     @property
     def margins(self) -> Dict[str, float]:
-        """Worst leave-one-out under-prediction per resource (fraction), for get_vu13p_budget."""
+        """Worst leave-one-out under-prediction per resource (fraction), for get_vu13p_budget.
+
+        Points whose leverage in the fit of that resource is >= MAX_LEVERAGE are skipped: such a
+        point alone determines a coefficient (e.g. u16 is the only design with many DSPs, which is
+        all that identifies FF per DSP), so leaving it out is an extrapolation of an unidentified
+        model, not a test of the prediction error. DSP counts have no fitted coefficient.
+        """
         out = {}
         for key in ("DSP", "LUT", "FF"):
-            errs = [c["loo_rel_err"][key] for c in self.calibration if c["in_domain"] and c["loo_rel_err"]]
+            errs = [
+                c["loo_rel_err"][key] for c in self.calibration
+                if c["in_domain"] and c["loo_rel_err"] and c["leverage"].get(key, 0.0) < self.MAX_LEVERAGE
+            ]
             out[key] = float(max([0.0] + [-e for e in errs if np.isfinite(e)]))
         return out
 
@@ -286,11 +297,18 @@ class CostModel:
         c_lut, c_ff = solve(fit)
         model = cls(float(c_lut[0]), float(c_lut[1]), float(c_ff[0]), float(c_ff[1]), float(c_ff[2]),
                     dsp_min_bits=dsp_min_bits, dsp_min_csd=dsp_min_csd)
+        def leverages(x):
+            return np.diag(x @ np.linalg.pinv(x.T @ x) @ x.T)
+
+        x_lut, x_ff = cls._design(fit)
+        leverage = {r["name"]: {"LUT": float(hl), "FF": float(hf)}
+                    for r, hl, hf in zip(fit, leverages(x_lut), leverages(x_ff))}
         enough = len(fit) > 3  # leave-one-out needs more points than FF coefficients
         for row in rows:
             pred = predict(c_lut, c_ff, row)
             entry = {"name": row["name"], "in_domain": row["in_domain"], "predicted": pred,
-                     "measured": row["measured"], "rel_err": rel(pred, row["measured"]), "loo_rel_err": None}
+                     "measured": row["measured"], "rel_err": rel(pred, row["measured"]), "loo_rel_err": None,
+                     "leverage": leverage.get(row["name"], {})}
             if row["in_domain"] and enough:
                 cl, cf = solve([q for q in fit if q["name"] != row["name"]])
                 entry["loo_rel_err"] = rel(predict(cl, cf, row), row["measured"])
@@ -307,6 +325,7 @@ class CostModel:
                 row[f"{k}_predicted"] = c["predicted"][k]
                 row[f"{k}_rel_err"] = c["rel_err"][k]
                 row[f"{k}_loo_rel_err"] = c["loo_rel_err"][k] if c["loo_rel_err"] else float("nan")
+                row[f"{k}_leverage"] = c["leverage"].get(k, float("nan"))
             out.append(row)
         return out
 

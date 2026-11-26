@@ -598,19 +598,19 @@ def plot_primal_dual_kkt_evolution(
 
     fig, axes = plt.subplots(1, 3, figsize=(16.5, 4.8))
 
-    # 1. SP-Index & Lagrangian Objective Evolution
+    # 1. SP-Index & Dual Lagrangian Value Evolution
     ax1 = axes[0]
     ax1_twin = ax1.twinx()
     l1 = ax1.plot(iters, sp_vals, color="#1f4e79", marker="o", lw=2.2, label="Índice-SP Val [%]")
     l2 = ax1_twin.plot(
-        iters, lag_costs, color="#d95f02", marker="s", linestyle="--", lw=1.8, label="Custo Lagrangeano L(x, μ)"
+        iters, lag_costs, color="#d95f02", marker="s", linestyle="--", lw=1.8, label="Dual Lagrangeano q(μ*) [Ω]"
     )
     if conv_iters:
-        ax1.axvline(conv_iters[0], color="forestgreen", linestyle=":", lw=2.0, label=f"Convergência KKT (t={conv_iters[0]})")
-    ax1.set_title(f"{title_prefix}: Índice-SP vs. Iteração", fontweight="bold")
-    ax1.set_xlabel("Iteração Primal-Dual (t)")
+        ax1.axvline(conv_iters[0], color="forestgreen", linestyle=":", lw=2.0, label=f"KKT OK (t={conv_iters[0]})")
+    ax1.set_title(f"{title_prefix}: Índice-SP e Dual KKT", fontweight="bold")
+    ax1.set_xlabel("Passo da Bisseção de Orçamento (t)")
     ax1.set_ylabel("Índice-SP de Validação [%]", color="#1f4e79")
-    ax1_twin.set_ylabel("Custo Lagrangeano L(x, μ)", color="#d95f02")
+    ax1_twin.set_ylabel("Dual Lagrangeano q(μ*) [Ω]", color="#d95f02")
     ax1.grid(True, linestyle=":", alpha=0.5)
     lines = l1 + l2
     labels = [l.get_label() for l in lines]
@@ -628,14 +628,14 @@ def plot_primal_dual_kkt_evolution(
             label=f"μ_{rk} (Preço de Sombra)",
         )
     if conv_iters:
-        ax2.axvline(conv_iters[0], color="forestgreen", linestyle=":", lw=2.0, label=f"Ótimo KKT (t={conv_iters[0]})")
-    ax2.set_title("Evolução dos Multiplicadores (μ_j) - VU13P", fontweight="bold")
-    ax2.set_xlabel("Iteração Primal-Dual (t)")
+        ax2.axvline(conv_iters[0], color="forestgreen", linestyle=":", lw=2.0, label=f"KKT OK (t={conv_iters[0]})")
+    ax2.set_title("Preços de Sombra KKT (μ_j) - VU13P", fontweight="bold")
+    ax2.set_xlabel("Passo da Bisseção de Orçamento (t)")
     ax2.set_ylabel("Multiplicador Dual (μ_j ≥ 0)")
     ax2.grid(True, linestyle=":", alpha=0.5)
     ax2.legend(loc="best")
 
-    # 3. Normalized Constraint Violations g_j(x) <= 0
+    # 3. Normalized Constraint Violations g_j(w*) <= 0
     ax3 = axes[2]
     ax3.axhline(0.0, color="crimson", linestyle="--", lw=1.8, label="Limite Viável (g_j = 0)")
     for rk in res_keys:
@@ -645,12 +645,12 @@ def plot_primal_dual_kkt_evolution(
             marker=markers.get(rk, "o"),
             color=colors.get(rk, "black"),
             lw=1.8,
-            label=f"g_{rk}(x) [%]",
+            label=f"g_{rk}(w*) [%]",
         )
     if conv_iters:
         ax3.axvline(conv_iters[0], color="forestgreen", linestyle=":", lw=2.0)
-    ax3.set_title("Viabilidade Primal das Restrições g_j(x) ≤ 0", fontweight="bold")
-    ax3.set_xlabel("Iteração Primal-Dual (t)")
+    ax3.set_title("Folga das Restrições KKT g_j(w*) ≤ 0", fontweight="bold")
+    ax3.set_xlabel("Passo da Bisseção de Orçamento (t)")
     ax3.set_ylabel("Excesso / Folga Relativa ao Orçamento [%]")
     ax3.grid(True, linestyle=":", alpha=0.5)
     ax3.legend(loc="best")
