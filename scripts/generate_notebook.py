@@ -89,6 +89,7 @@ from src.models import (
     build_compact_cnn1d_fp32,
     build_compact_qcnn1d,
     transfer_weights_to_qmodel,
+    weight_integer_bits,
 )
 from src.exporter import ArtifactExporter
 from src.visualization import (
@@ -132,7 +133,10 @@ IETA = 0
 VERSION = 2        # 0 (100 anéis), 1 (50 anéis), ou 2 (25 anéis)
 N_SPLITS = 5       # Folds para validação cruzada
 EPOCHS_CV = 25     # Épocas por fold com Warm-Start e ReduceLROnPlateau
-QAT_EPOCHS = 8     # Épocas de QAT por candidato no laço de alocação
+# QAT a partir do FP32: taxa menor que a do treino FP32, faixa de cada quantizador de pesos ajustada
+# a max|W| do FP32 e checkpoint com melhor SP entre as épocas com val_loss <= 1,2 x a mínima
+QAT_LEARNING_RATE = 3e-4
+MAX_LOSS_RATIO = 1.2
 
 # Dados: diretório com os arquivos <DATASET_PREFIX>.et<IET>_eta<IETA>.h5 (variável RINGER_DATA_DIR)
 DATA_DIR = os.environ.get("RINGER_DATA_DIR", os.path.join(repo_root, "data"))
@@ -232,7 +236,7 @@ $$\min_{\mathbf{w}} \sum_l c_l 4^{-w_l} \quad \text{s.a.} \quad \tilde{g}_j(\mat
 
 Em cada passo $t$:
 1. **Lagrange/KKT**: para o orçamento $B^{(t)}$, `compute_primal_bit_update` acha os preços-sombra $\mu_j$ por ascensão dual até as condições KKT e devolve o ótimo inteiro;
-2. **QKeras**: o candidato é treinado com QAT (*warm-start* do FP32, mesma semente para todos);
+2. **QKeras**: o candidato é treinado com QAT (*warm-start* do FP32, mesma semente para todos, taxa de aprendizado 3e-4, faixa de cada quantizador de pesos ajustada a max|W| do FP32 e checkpoint de maior SP entre as épocas com `val_loss` ≤ 1,2× a mínima, para não exportar um modelo descalibrado);
 3. **SP e custo**: mede o SP de validação e recalcula os recursos com os pesos treinados. Se o SP se mantém e cabe no teto, o orçamento desce; se não, sobe (bisseção em $\log B$).
 """))
 
@@ -261,18 +265,21 @@ y_sample_tf = tf.convert_to_tensor(y_val_ref[sample_idx], dtype=tf.float32)[:, N
 bce_loss = keras.losses.BinaryCrossentropy()
 
 traces = compute_hutchinson_hessian_trace(model_fp32, bce_loss, x_sample_tf, y_sample_tf, num_hvp=32, seed=SEED)
-c_coeffs = compute_layer_c_coefficients(model_fp32, traces)
 
 layer_names = [item["layer_name"] for item in hw_fp32["breakdown"]]
+# Faixa de cada quantizador de pesos a partir do FP32 (c_l usa a largura 2^(I_l + 1) dessa faixa)
+range_integer_bits_8 = weight_integer_bits(model_fp32, {name: 8 for name in layer_names})
+c_coeffs = compute_layer_c_coefficients(model_fp32, traces, integer_bits=range_integer_bits_8)
 macs_list = [float(item["macs"]) for item in hw_fp32["breakdown"]]
 params_list = [float(item["params"]) for item in hw_fp32["breakdown"]]
 c_list = [c_coeffs[name] for name in layer_names]
 bops_uniform_8bit = sum(m * 64.0 for m in macs_list)
 print("Tr(H_l):", {k: f"{v:.4g}" for k, v in traces.items()})
 print("c_l    :", {k: f"{v:.4g}" for k, v in c_coeffs.items()})
+print("I_l    :", range_integer_bits_8, "(faixa [-2^I, 2^I) dos pesos)")
 
 # Custo de cada candidato antes do treino: pesos FP32 quantizados no modelo calibrado
-cost_fn = make_cost_fn(model_fp32, input_bits=INPUT_BITS)
+cost_fn = make_cost_fn(model_fp32, input_bits=INPUT_BITS, range_from_weights=True)
 
 
 def train_qat_candidate(w_bits):
@@ -280,7 +287,8 @@ def train_qat_candidate(w_bits):
     q_cand, cb_cand, _ = train_qat(
         ARCH, w_bits, ACT_BITS, INPUT_BITS, model_fp32,
         X_tr_ref, y_tr_ref, X_val_ref, y_val_ref,
-        epochs=QAT_EPOCHS, learning_rate=8e-4, patience=5, seed=SEED, reduce_lr=False,
+        epochs=EPOCHS_CV, learning_rate=QAT_LEARNING_RATE, seed=SEED,
+        range_from_warm_start=True, max_loss_ratio=MAX_LOSS_RATIO,
     )
     return float(cb_cand.best_sp), q_cand
 
@@ -298,6 +306,7 @@ def evaluate_candidate(w_bits):
         )
         evaluated[key] = {
             "w_bits": {name: int(w_bits[name]) for name in layer_names},
+            "weight_integer_bits": {name: int(q_cand.get_layer(name).kernel_quantizer_internal.integer) for name in layer_names},
             "sp_val": sp_val,
             "resources": {k: float(v) for k, v in hw_cand["vu13p_resources"].items()},
         }
@@ -449,7 +458,8 @@ for fold_idx, (tr_idx, val_idx) in enumerate(fold_splits, start=1):
     fp32_f, _, _ = train_fp32(ARCH, X_tr_f, y_tr_f, X_val_f, y_val_f, epochs=EPOCHS_CV, seed=SEED + fold_idx)
     u8_f, cb_u8_f, hist_u8_f = train_qat(
         ARCH, w_8bit, ACT_BITS, INPUT_BITS, fp32_f, X_tr_f, y_tr_f, X_val_f, y_val_f,
-        epochs=EPOCHS_CV, seed=SEED + fold_idx,
+        epochs=EPOCHS_CV, learning_rate=QAT_LEARNING_RATE, seed=SEED + fold_idx,
+        range_from_warm_start=True, max_loss_ratio=MAX_LOSS_RATIO,
     )
     fold_refs[fold_idx] = {
         "fp32": {"model": fp32_f, "eval": evaluate_model(fp32_f, X_val_f, y_val_f, X_holdout, y_holdout)},
@@ -467,7 +477,8 @@ def cross_validate(w_bits):
         X_tr_f, y_tr_f, X_val_f, y_val_f = X_dev[tr_idx], y_dev[tr_idx], X_dev[val_idx], y_dev[val_idx]
         q_f, cb_f, hist_f = train_qat(
             ARCH, w_bits, ACT_BITS, INPUT_BITS, fold_refs[fold_idx]["fp32"]["model"],
-            X_tr_f, y_tr_f, X_val_f, y_val_f, epochs=EPOCHS_CV, seed=SEED + fold_idx,
+            X_tr_f, y_tr_f, X_val_f, y_val_f, epochs=EPOCHS_CV, learning_rate=QAT_LEARNING_RATE,
+            seed=SEED + fold_idx, range_from_warm_start=True, max_loss_ratio=MAX_LOSS_RATIO,
         )
         runs.append({
             "fold": fold_idx, "model": q_f, "best_epoch": cb_f.best_epoch + 1, "history": hist_f,
@@ -587,6 +598,14 @@ print(f"\n[Modelo exportado: fold #{best_fold_idx}] holdout no limiar da valida�
 print(f"  • Recursos VU13P: {', '.join(f'{k} = {v:,.0f}' for k, v in hw_qkeras_kkt['vu13p_resources'].items())}")
 
 kkt_result["integer_bits"] = kkt_weights_bits
+kkt_result["weight_integer_bits"] = {
+    name: int(best_qmodel.get_layer(name).kernel_quantizer_internal.integer) for name in layer_names
+}
+kkt_result["qat"] = {
+    "learning_rate": QAT_LEARNING_RATE,
+    "max_loss_ratio": MAX_LOSS_RATIO,
+    "weight_range": "per layer from the warm-start FP32 (src.models.weight_integer_bits)",
+}
 kkt_result["cv_confirmation"] = {
     **cv_decision,
     "paired_diff_vs_fp32": diff_kkt_fp32,

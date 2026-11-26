@@ -10,11 +10,11 @@ import tf_keras as keras
 from sklearn.metrics import auc, roc_curve
 
 from src.metrics import SPCallback, compute_sp_with_threshold, sp_at_threshold
-from src.models import build_compact_cnn1d_fp32, build_compact_qcnn1d, transfer_weights_to_qmodel
+from src.models import build_compact_cnn1d_fp32, build_compact_qcnn1d, transfer_weights_to_qmodel, weight_integer_bits
 
 
-def _fit(model, X_tr, y_tr, X_val, y_val, epochs, patience, reduce_lr):
-    cb = SPCallback(val_data=(X_val, y_val), patience=patience)
+def _fit(model, X_tr, y_tr, X_val, y_val, epochs, patience, reduce_lr, max_loss_ratio=None):
+    cb = SPCallback(val_data=(X_val, y_val), patience=patience, max_loss_ratio=max_loss_ratio)
     callbacks = [cb]
     if reduce_lr:
         callbacks.append(keras.callbacks.ReduceLROnPlateau(
@@ -45,15 +45,23 @@ def train_qat(
     arch: Dict[str, int], w_bits: Dict[str, int], a_bits: Dict[str, int], input_bits: Optional[int],
     warm_start: keras.Model, X_tr, y_tr, X_val, y_val, epochs: int,
     learning_rate: float = 1e-3, patience: int = 8, seed: int = 42, reduce_lr: bool = True,
+    range_from_warm_start: bool = False, max_loss_ratio: Optional[float] = None,
 ) -> Tuple[keras.Model, SPCallback, Dict[str, list]]:
-    """QAT of the QKeras model, warm-started from ``warm_start`` (an FP32 model trained on the same X_tr)."""
+    """QAT of the QKeras model, warm-started from ``warm_start`` (an FP32 model trained on the same X_tr).
+
+    ``range_from_warm_start`` sets each layer's weight quantizer range from the warm-start weights
+    (src.models.weight_integer_bits); ``max_loss_ratio`` restricts the restored epoch to the
+    well-calibrated ones (src.metrics.SPCallback).
+    """
     keras.utils.set_random_seed(seed)
+    integer_bits = weight_integer_bits(warm_start, w_bits) if range_from_warm_start else None
     model = build_compact_qcnn1d(
         arch["input_dim"], arch["filters"], arch["kernel"], arch["dense_units"],
         weights_bits=w_bits, act_bits=a_bits, input_bits=input_bits, learning_rate=learning_rate,
+        weight_integer_bits=integer_bits,
     )
     transfer_weights_to_qmodel(warm_start, model)
-    cb, history = _fit(model, X_tr, y_tr, X_val, y_val, epochs, patience, reduce_lr)
+    cb, history = _fit(model, X_tr, y_tr, X_val, y_val, epochs, patience, reduce_lr, max_loss_ratio)
     return model, cb, history
 
 

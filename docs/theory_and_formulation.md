@@ -63,13 +63,13 @@ Em vez de forçar quantização uniforme ($b_i = 8$ bits em todas as camadas), a
 
 ### 3.1 Modelo da Perturbação e Sensibilidade Hessiana
 
-Os pesos e bias da camada $i$ são quantizados por `quantized_bits(b_i, I, alpha=1)` (`src/models.py`), com $I = 2$ bits inteiros para $b_i \ge 3$. A faixa é fixa, $[-2^I, 2^I)$, de largura $\kappa = 2^{I+1} = 8$, e o passo é:
+Os pesos e bias da camada $i$ são quantizados por `quantized_bits(b_i, I_i, alpha=1)` (`src/models.py`), de faixa fixa $[-2^{I_i}, 2^{I_i})$ e largura $\kappa_i = 2^{I_i+1}$. $I_i$ é o menor inteiro com $\max(|\mathbf{W}_i|, |\mathbf{b}_i|) \le 2^{I_i}$ no FP32 de *warm-start* (limitado a $b_i - 1$): os pesos treinados vão até ~2,3 em módulo, e a faixa padrão $\pm 4$ ($I = 2$) desperdiçaria 1 a 2 bits de resolução nas camadas de pesos menores. O passo é:
 
-$$\Delta_i = \kappa \cdot 2^{-b_i} = 2^{I + 1 - b_i}$$
+$$\Delta_i = \kappa_i \cdot 2^{-b_i} = 2^{I_i + 1 - b_i}$$
 
 Sob a hipótese de ruído de arredondamento uniforme, a variância do erro de quantização de cada peso é $\sigma^2 = \frac{\Delta_i^2}{12}$. Para os $n_i$ parâmetros da camada $i$:
 
-$$\|\mathbf{W}_{q,i} - \mathbf{W}_i\|_2^2 \approx n_i \frac{\Delta_i^2}{12} = \frac{n_i \kappa^2}{12} 4^{-b_i}$$
+$$\|\mathbf{W}_{q,i} - \mathbf{W}_i\|_2^2 \approx n_i \frac{\Delta_i^2}{12} = \frac{n_i \kappa_i^2}{12} 4^{-b_i}$$
 
 Pela expansão de Taylor de segunda ordem da função de perda $\mathcal{L}$ em torno do ponto de mínimo ($\nabla_{\mathbf{W}} \mathcal{L} \approx \mathbf{0}$), e como os erros de arredondamento de pesos diferentes são independentes e de média nula (só a diagonal de $\mathbf{H}$ contribui em média):
 
@@ -77,9 +77,9 @@ $$\Delta \mathcal{L} \approx \frac{1}{2} \Delta \mathbf{W}^T \mathbf{H} \, \Delt
 
 onde $\operatorname{Tr}(\mathbf{H}_i)$ é o traço **total** do bloco diagonal da camada (soma sobre os $n_i$ pesos) e $\operatorname{Tr}(\mathbf{H}_i)/n_i$ é a curvatura média, como em HAWQ-V2/V3 e Campos et al. O fator $n_i$ do erro cancela com o da curvatura média:
 
-$$\Omega_i(b_i) \approx c_i 4^{-b_i}, \quad \text{onde } c_i = \frac{\operatorname{Tr}(\mathbf{H}_i) \, \kappa^2}{24}$$
+$$\Omega_i(b_i) \approx c_i 4^{-b_i}, \quad \text{onde } c_i = \frac{\operatorname{Tr}(\mathbf{H}_i) \, \kappa_i^2}{24}$$
 
-A constante $\frac{1}{2}$ e o valor de $\kappa$ (comum a todas as camadas) só mudam a escala de $\Omega$ e do multiplicador $\lambda$; a alocação depende das razões $c_i / a_i$.
+A constante $\frac{1}{2}$ só muda a escala de $\Omega$ e do multiplicador $\lambda$; a alocação depende das razões $c_i / a_i$, e uma camada de faixa menor (menor $\kappa_i$) precisa de menos bits para o mesmo erro.
 
 #### Estimativa do Traço da Hessiana via Algoritmo de Hutchinson (HVP)
 Como calcular a matriz Hessiana completa $\mathbf{H} \in \mathbb{R}^{P \times P}$ é inviável, o traço $\operatorname{Tr}(\mathbf{H}_i)$ é estimado sem formar a matriz através de produtos Hessiana-vetor (HVP) com vetores aleatórios de Rademacher $\mathbf{z} \in \{-1, +1\}^{n_i}$, sorteados para cada camada separadamente:

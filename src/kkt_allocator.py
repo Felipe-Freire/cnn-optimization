@@ -2,7 +2,7 @@
 
 import itertools
 import warnings
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 import numpy as np
 import tensorflow as tf
 
@@ -72,7 +72,7 @@ def compute_hutchinson_hessian_trace(
 def compute_layer_c_coefficients(
     model: tf.keras.Model,
     traces: Dict[str, float],
-    integer_bits: int = QUANTIZER_INTEGER_BITS,
+    integer_bits: Union[int, Dict[str, int]] = QUANTIZER_INTEGER_BITS,
 ) -> Dict[str, float]:
     """Sensitivity c_l of the quantization model Omega_l(b) = c_l * 4^(-b).
 
@@ -92,15 +92,16 @@ def compute_layer_c_coefficients(
     Args:
         model: Trained model.
         traces: Full Hessian trace per layer (sum over the kernel entries).
-        integer_bits: Integer bits I of the weight quantizer.
+        integer_bits: Integer bits I of the weight quantizer, one value or one per layer.
 
     Returns:
         Dictionary mapping layer name to c_l.
     """
-    kappa = 2.0 ** (integer_bits + 1)
     c_coeffs = {}
     for layer in model.layers:
         if layer.name in traces and hasattr(layer, "kernel") and layer.kernel is not None:
+            integer = integer_bits.get(layer.name, QUANTIZER_INTEGER_BITS) if isinstance(integer_bits, dict) else integer_bits
+            kappa = 2.0 ** (int(integer) + 1)
             c_coeffs[layer.name] = float(traces[layer.name] * kappa ** 2 / 24.0)
     return c_coeffs
 

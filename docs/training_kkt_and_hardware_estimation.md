@@ -71,6 +71,8 @@ Durante o treinamento supervisionado no TensorFlow/QKeras, utilizamos **duas mé
 ### 1.4 Transferência de Pesos (*Warm-Start* QAT)
 A função [`transfer_weights_to_qmodel(model_fp32, qmodel)`](file:///home/iaraujo/Documentos/Github/cnn-optimization/src/models.py#L129-L146) copia os pesos já convergidos do modelo de referência FP32 para o modelo QKeras antes de iniciar o *Quantization-Aware Training* (QAT), eliminando variância estocástica de inicialização e acelerando a convergência. Na validação cruzada, o FP32 de cada fold é treinado só com o treino daquele fold (`src/training.py`), para que nenhum evento de validação tenha sido visto pelo *warm-start*; FP32, 8 bits uniforme e a alocação escolhida usam os mesmos folds, a mesma semente e o mesmo *warm-start*, e o holdout é avaliado no limiar escolhido na validação de cada fold.
 
+O QAT usa taxa de aprendizado 3e-4 (menor que a do FP32), faixa de cada quantizador de pesos ajustada a max|W| do FP32 de *warm-start* e checkpoint de maior SP **entre as épocas com `val_loss` ≤ 1,2× a mínima do treino** (`SPCallback(max_loss_ratio=1.2)`). Como o SP só depende da ordenação, escolher a época apenas pelo SP às vezes guardava um modelo descalibrado (`val_loss` dezenas de vezes a mínima, limiar do joelho de 1e-5 ou menos, que a sigmoide em ponto fixo do FPGA não representa); em 3 folds × 5 configurações de poucos bits isso acontecia em 7 a 8 de 15 treinos e deixou de acontecer com a regra.
+
 ---
 
 ## Parte 2: Como Funciona a Otimização da Quantidade de Bits (Lagrange e KKT)
@@ -89,7 +91,7 @@ A resolução implementada em [`src/kkt_allocator.py`](file:///home/iaraujo/Docu
    - Com $B_{\text{DSP}} = 0$, limita $w_l, a_l \le 8\text{ bits}$ (sem `DSP48E2`). Para os preços $\mu_j$, cada bit de peso da camada $l$ custa $\pi_l = \sum_j \mu_j \, \frac{\partial R_j/\partial w_l}{B_j}$ e a condição de estacionaridade dá:
      $$w_l(\boldsymbol{\mu}) = \operatorname{clip}\!\left( \frac{1}{2} \log_2\!\left( \frac{c_l \ln 4}{\pi_l} \right), \, b_{\min}, \, b_{\max} \right)$$
    - Os preços são ajustados por ascensão dual até a solução contínua satisfazer as condições KKT ([`solve_relaxed_dual`](file:///home/iaraujo/Documentos/Github/cnn-optimization/src/kkt_allocator.py)); os bits inteiros são o ótimo exato da enumeração no modelo de custo.
-   - O notebook procura, por bisseção no orçamento de LUT, o menor custo que preserva o SP do 8 bits uniforme (seção 5 de `theory_and_formulation.md`). Em `et5_eta0` (teto de 1 % da VU13P), a escolha foi `w = [5, 4, 3]`, `a = [8, 8]`, entrada de 8 bits: 9,3 mil LUTs previstas pelo modelo calibrado (40 % do 8 bits uniforme), 0 DSP. CV pareada em 5 folds: SP 97,72 %, diferença para o 8 bits uniforme de −0,05 ± 0,04 p.p. (erro padrão 0,02) e para o FP32 de −0,01 ± 0,04 p.p.; holdout no limiar da validação, média dos folds: 97,70 % (8 bits: 97,75 %, FP32: 97,71 %).
+   - O notebook procura, por bisseção no orçamento de LUT, o menor custo que preserva o SP do 8 bits uniforme (seção 5 de `theory_and_formulation.md`). Em `et5_eta0` (teto de 1 % da VU13P), a escolha foi `w = [5, 3, 8]`, `a = [8, 8]`, entrada de 8 bits: 9,2 mil LUTs previstas pelo modelo calibrado (37 % do 8 bits uniforme), 0 DSP. CV pareada em 5 folds: SP 97,70 %, diferença para o 8 bits uniforme de −0,05 ± 0,06 p.p. (erro padrão 0,03) e para o FP32 de −0,03 ± 0,04 p.p.; holdout no limiar da validação, média dos folds: 97,69 % (8 bits: 97,73 %, FP32: 97,71 %).
 
 ---
 

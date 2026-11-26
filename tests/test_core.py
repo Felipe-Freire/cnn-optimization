@@ -469,3 +469,35 @@ def test_vu13p_estimator_and_primal_dual_kkt(tmp_path):
 
     plot_path = plot_primal_dual_kkt_evolution(opt.history, save_path=str(tmp_path / "kkt_evo.png"))
     assert os.path.isfile(plot_path) and os.path.getsize(plot_path) > 0
+
+
+def test_cost_model_uses_the_trained_quantizer_range():
+    """Codes are taken with each layer's own quantizer range, and the pre-training cost function
+    with range_from_weights matches the cost of the QAT model built with those ranges."""
+    from src.models import transfer_weights_to_qmodel, weight_integer_bits
+    from src.hardware import layer_specs_from_model, RAMB18_BITS
+
+    fp32 = _seeded_fp32_model()
+    w_bits = {"conv1d_1": 5, "dense_1": 4, "output_dense": 3}
+    act = {"conv1d_1": 8, "dense_1": 8}
+    integer = weight_integer_bits(fp32, w_bits)
+    q = build_compact_qcnn1d(input_dim=25, weights_bits=w_bits, act_bits=act, input_bits=8, weight_integer_bits=integer)
+    transfer_weights_to_qmodel(fp32, q)
+
+    for spec in layer_specs_from_model(q, w_bits, act, input_bits=8):
+        layer = q.get_layer(spec.name)
+        lsb = 2.0 ** (integer[spec.name] + 1 - w_bits[spec.name])
+        quantized = np.asarray(layer.kernel_quantizer_internal(layer.kernel)).reshape(spec.kernel_int.shape)
+        np.testing.assert_allclose(spec.kernel_int * lsb, quantized)
+
+    expected = calibrated_resources(q, w_bits, act, input_bits=8)["total"]
+    got = make_cost_fn(fp32, input_bits=8, range_from_weights=True)(w_bits, act)
+    for key in ("DSP", "LUT", "FF"):
+        assert got[key] == pytest.approx(expected[key])
+    assert got["BRAM_bits"] == RAMB18_BITS
+
+
+def test_layer_c_coefficients_with_per_layer_ranges():
+    model = build_compact_cnn1d_fp32(input_dim=25, num_filters=8, kernel_size=3, dense_units=8)
+    c = compute_layer_c_coefficients(model, {n: 1.0 for n in LAYERS}, integer_bits={"conv1d_1": 2, "dense_1": 1, "output_dense": 0})
+    assert c["conv1d_1"] == pytest.approx(64 / 24) and c["dense_1"] == pytest.approx(16 / 24) and c["output_dense"] == pytest.approx(4 / 24)

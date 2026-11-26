@@ -143,18 +143,27 @@ def sp_at_threshold(
 
 
 class SPCallback(Callback):
-    """Keras Callback for monitoring SP index and saving best model weights."""
+    """Keras Callback for monitoring SP index and saving best model weights.
+
+    The SP only depends on how the scores rank the events, so the epoch with the best SP can be
+    one whose outputs are badly calibrated (validation loss many times its minimum, knee threshold
+    near 0 or 1), which a fixed-point sigmoid cannot represent. With ``max_loss_ratio`` the restored
+    epoch is the best-SP epoch among those whose validation loss is at most ``max_loss_ratio``
+    times the lowest validation loss of the run. Early stopping still follows the plain SP.
+    """
 
     def __init__(
         self,
         val_data: Tuple[np.ndarray, np.ndarray],
         patience: int = 15,
         verbose: bool = False,
+        max_loss_ratio: Optional[float] = None,
     ):
         super().__init__()
         self.val_x, self.val_y = val_data
         self.patience = patience
         self.verbose = verbose
+        self.max_loss_ratio = max_loss_ratio
         self.best_sp = -1.0
         self.best_epoch = 0
         self.best_weights = None
@@ -162,6 +171,7 @@ class SPCallback(Callback):
         self.best_fa_at_knee = 1.0
         self.best_threshold = 0.5
         self.wait = 0
+        self.epochs: list = []
 
     def on_epoch_end(self, epoch: int, logs: Optional[Dict[str, float]] = None) -> None:
         if logs is None:
@@ -173,6 +183,11 @@ class SPCallback(Callback):
         logs["val_sp"] = sp_val
         logs["val_pd_knee"] = pd_knee
         logs["val_fa_knee"] = fa_knee
+        if self.max_loss_ratio is not None:
+            self.epochs.append({
+                "epoch": epoch, "sp": sp_val, "pd": pd_knee, "fa": fa_knee, "threshold": thresh,
+                "val_loss": float(logs.get("val_loss", np.nan)), "weights": self.model.get_weights(),
+            })
 
         if sp_val > self.best_sp:
             self.best_sp = sp_val
@@ -198,6 +213,17 @@ class SPCallback(Callback):
                 self.model.stop_training = True
 
     def restore_best_weights(self) -> None:
-        """Restores model to the best recorded SP weights."""
+        """Restores the selected epoch (best SP, among the well-calibrated epochs if max_loss_ratio is set)."""
+        if self.max_loss_ratio is not None and self.epochs:
+            losses = np.array([e["val_loss"] for e in self.epochs])
+            if np.all(np.isfinite(losses)):
+                limit = self.max_loss_ratio * losses.min()
+                eligible = [e for e in self.epochs if e["val_loss"] <= limit]
+            else:
+                eligible = self.epochs
+            chosen = max(eligible, key=lambda e: e["sp"])
+            self.best_sp, self.best_epoch = chosen["sp"], chosen["epoch"]
+            self.best_pd_at_knee, self.best_fa_at_knee = chosen["pd"], chosen["fa"]
+            self.best_threshold, self.best_weights = chosen["threshold"], chosen["weights"]
         if self.best_weights is not None:
             self.model.set_weights(self.best_weights)

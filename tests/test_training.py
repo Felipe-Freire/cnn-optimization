@@ -63,3 +63,65 @@ def test_qat_starts_from_the_given_fp32_weights():
     for name in ("conv1d_1", "dense_1", "output_dense"):
         for w_fp32, w_q in zip(fp32.get_layer(name).get_weights(), qat.get_layer(name).get_weights()):
             np.testing.assert_array_equal(w_fp32, w_q)
+
+
+class _StubModel:
+    """Returns preset validation scores per epoch and records the restored weights."""
+
+    def __init__(self, scores_per_epoch):
+        self.scores_per_epoch, self.epoch, self.weights = scores_per_epoch, 0, None
+
+    def predict(self, x, batch_size=None, verbose=0):
+        return self.scores_per_epoch[self.epoch]
+
+    def get_weights(self):
+        return [self.epoch]
+
+    def set_weights(self, weights):
+        self.weights = weights
+
+
+def test_checkpoint_skips_badly_calibrated_epochs():
+    """Epoch 0 ranks best but its validation loss is 50x the minimum: it is skipped with the guard."""
+    from src.metrics import SPCallback
+
+    y = np.array([1, 1, 1, 0, 0, 0])
+    perfect = np.array([1e-5, 9e-6, 8e-6, 3e-6, 2e-6, 1e-6])  # perfect ranking, scores near 0
+    good = np.array([0.9, 0.8, 0.3, 0.4, 0.2, 0.1])            # one error, sensible scores
+    for ratio, expected_epoch in [(None, 0), (1.2, 1)]:
+        stub = _StubModel([perfect, good])
+        cb = SPCallback((np.zeros((6, 1)), y), patience=10, max_loss_ratio=ratio)
+        cb.set_model(stub)
+        for epoch, val_loss in enumerate([5.0, 0.1]):
+            stub.epoch = epoch
+            cb.on_epoch_end(epoch, {"val_loss": val_loss})
+        cb.restore_best_weights()
+        assert stub.weights == [expected_epoch]
+        assert cb.best_epoch == expected_epoch
+
+
+def test_range_integer_bits():
+    from src.models import range_integer_bits
+
+    assert range_integer_bits(0.9, 8) == 0   # [-1, 1)
+    assert range_integer_bits(1.0, 8) == 0
+    assert range_integer_bits(1.6, 8) == 1   # [-2, 2)
+    assert range_integer_bits(2.3, 8) == 2   # [-4, 4)
+    assert range_integer_bits(2.3, 2) == 1   # capped at b - 1
+
+
+def test_qat_quantizer_range_follows_the_warm_start_weights():
+    from src.models import weight_integer_bits
+
+    rng = np.random.default_rng(2)
+    x = rng.random((64, 25)).astype(np.float32)
+    y = (x[:, 0] > 0.5).astype(np.float32)
+    fp32, _, _ = train_fp32(ARCH, x, y, x, y, epochs=1, seed=3)
+    w_bits = {"conv1d_1": 5, "dense_1": 4, "output_dense": 3}
+    expected = weight_integer_bits(fp32, w_bits)
+    qat, _, _ = train_qat(ARCH, w_bits, {"conv1d_1": 8, "dense_1": 8}, 8, fp32, x, y, x, y,
+                          epochs=1, learning_rate=0.0, seed=3, reduce_lr=False, range_from_warm_start=True)
+    for name, integer in expected.items():
+        assert qat.get_layer(name).kernel_quantizer_internal.integer == integer
+        max_abs = max(np.abs(w).max() for w in fp32.get_layer(name).get_weights())
+        assert max_abs <= 2.0 ** integer or integer == w_bits[name] - 1

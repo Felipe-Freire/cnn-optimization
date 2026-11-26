@@ -50,7 +50,7 @@ import qkeras
 from qkeras.qtools import run_qtools
 from qkeras.qtools import settings as qtools_settings
 
-from src.models import quantizer_integer_bits
+from src.models import quantizer_integer_bits, weight_integer_bits as range_weight_integer_bits
 
 # AMD/Xilinx Virtex UltraScale+ VU13P Official Limits (Table 15 - FPGA Feature Summary)
 VU13P_CHIP_LIMITS: Dict[str, float] = {
@@ -143,9 +143,12 @@ def csd_digits(n: int) -> int:
     return count
 
 
-def quantize_weights_int(values: np.ndarray, bits: int) -> np.ndarray:
-    """Integer codes k of quantized_bits(bits, I, alpha=1) applied to float weights (w_q = k * LSB)."""
-    integer = quantizer_integer_bits(bits)
+def quantize_weights_int(values: np.ndarray, bits: int, integer: Optional[int] = None) -> np.ndarray:
+    """Integer codes k of quantized_bits(bits, I, alpha=1) applied to float weights (w_q = k * LSB).
+
+    ``integer`` is I (sign excluded); by default the model convention min(2, b - 1).
+    """
+    integer = quantizer_integer_bits(bits) if integer is None else int(integer)
     lsb = 2.0 ** (integer + 1 - int(bits))
     quantized = np.asarray(qkeras.quantized_bits(int(bits), integer, alpha=1)(np.asarray(values, dtype=np.float32)))
     return np.rint(quantized / lsb).astype(np.int64)
@@ -331,11 +334,15 @@ def layer_specs_from_model(
     input_bits: int = 8,
     default_weight_bits: int = 8,
     default_act_bits: int = 8,
+    weight_integer_bits: Optional[Dict[str, int]] = None,
 ) -> List[LayerSpec]:
     """LayerSpecs of a (FP32 or QKeras) model, quantizing its float weights with the model's quantizer.
 
     For an FP32 model this is post-training quantization of the reference weights, which is how the
     cost of a configuration is predicted before it is trained.
+
+    The integer bits of each layer's weight quantizer come from ``weight_integer_bits`` if given,
+    otherwise from the layer's own QKeras quantizer, otherwise min(2, b - 1).
     """
     weights_bits = weights_bits or {}
     if isinstance(act_bits, dict):
@@ -347,14 +354,21 @@ def layer_specs_from_model(
     specs = []
     for layer in layers:
         w_bits = int(weights_bits.get(layer.name, default_weight_bits))
+        quantizer = getattr(layer, "kernel_quantizer_internal", None)
+        if weight_integer_bits and layer.name in weight_integer_bits:
+            integer = int(weight_integer_bits[layer.name])
+        elif quantizer is not None and hasattr(quantizer, "integer"):
+            integer = int(quantizer.integer)
+        else:
+            integer = quantizer_integer_bits(w_bits)
         kernel = layer.kernel.numpy()
         n_out = kernel.shape[-1]
         bias = layer.bias.numpy() if getattr(layer, "bias", None) is not None else np.zeros(n_out, np.float32)
         positions = int(layer.output_shape[1]) if "Conv1D" in layer.__class__.__name__ else 1
         specs.append(LayerSpec(
             layer.name,
-            quantize_weights_int(kernel, w_bits).reshape(-1, n_out),
-            quantize_weights_int(bias, w_bits),
+            quantize_weights_int(kernel, w_bits, integer).reshape(-1, n_out),
+            quantize_weights_int(bias, w_bits, integer),
             w_bits,
             a_in[layer.name],
             positions,
@@ -369,10 +383,11 @@ def calibrated_resources(
     act_bits: Optional[Union[int, Dict[str, int]]] = 8,
     input_bits: int = 8,
     cost_model: Optional[CostModel] = None,
+    weight_integer_bits: Optional[Dict[str, int]] = None,
 ) -> Dict[str, Any]:
     """Calibrated VU13P resources of a model: totals {DSP, LUT, FF, BRAM_bits, RAMB18} and per layer."""
     cm = cost_model or get_cost_model()
-    specs = layer_specs_from_model(model, weights_bits, act_bits, input_bits)
+    specs = layer_specs_from_model(model, weights_bits, act_bits, input_bits, weight_integer_bits=weight_integer_bits)
     total = cm.estimate(specs)
     return {
         "total": {k: float(total[k]) for k in ("DSP", "LUT", "FF", "BRAM_bits", "RAMB18")},
@@ -384,11 +399,14 @@ def make_cost_fn(
     model: tf.keras.Model,
     input_bits: int = 8,
     cost_model: Optional[CostModel] = None,
+    range_from_weights: bool = False,
 ) -> Callable[[Dict[str, int], Dict[str, int]], Dict[str, float]]:
     """Cost function (weights_bits, act_bits) -> {DSP, LUT, FF, BRAM_bits} for the bit allocator.
 
     Uses the float weights of ``model`` (e.g. the FP32 reference) quantized at each candidate
-    precision. Each layer depends only on (w_l, a_in,l), so per-layer results are cached.
+    precision. With ``range_from_weights`` the integer bits of each layer follow
+    src.models.weight_integer_bits (the range the QAT model will be built with); otherwise
+    min(2, b - 1). Each layer depends only on (w_l, a_in,l), so per-layer results are cached.
     """
     cm = cost_model or get_cost_model()
     layers = [model.get_layer(name) for name in _compute_layer_names(model)]
@@ -398,7 +416,11 @@ def make_cost_fn(
     def layer_cost(layer, w_bits: int, a_in_bits: int) -> Dict[str, float]:
         key = (layer.name, w_bits, a_in_bits)
         if key not in cache:
-            spec = layer_specs_from_model(model, {layer.name: w_bits}, {}, input_bits)[names.index(layer.name)]
+            integer = (range_weight_integer_bits(model, {layer.name: w_bits}) if range_from_weights
+                       else {layer.name: quantizer_integer_bits(w_bits)})
+            spec = layer_specs_from_model(
+                model, {layer.name: w_bits}, {}, input_bits, weight_integer_bits=integer
+            )[names.index(layer.name)]
             spec.a_in_bits = a_in_bits
             cache[key] = cm.layer_resources(spec)
         return cache[key]
