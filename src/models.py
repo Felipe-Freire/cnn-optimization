@@ -1,12 +1,46 @@
 """Model builders for Compact CNN1D in FP32 and Quantized QKeras (ATLAS Trigger)."""
 
+import math
 import os
 os.environ["TF_USE_LEGACY_KERAS"] = "1"
 from typing import Dict, Optional, Tuple, Union
+
+import numpy as np
 import tensorflow as tf
 import tf_keras as keras
 import qkeras
 from qkeras import QActivation, QConv1D, QDense, quantized_bits, quantized_relu
+
+# Integer bits (sign excluded) of the weight, bias and ReLU quantizers for b >= 3 bits.
+# quantized_bits(b, I, alpha=1) covers [-2^I, 2^I) with step 2^(I + 1 - b).
+QUANTIZER_INTEGER_BITS = 2
+
+
+def quantizer_integer_bits(bits: int) -> int:
+    """Integer bits used by the quantizers of the model: min(2, b - 1)."""
+    return min(QUANTIZER_INTEGER_BITS, max(0, int(bits) - 1))
+
+
+def range_integer_bits(max_abs: float, bits: int) -> int:
+    """Smallest integer bits I with max_abs <= 2^I, capped at b - 1 (I = 0 gives the range [-1, 1))."""
+    needed = math.ceil(math.log2(max_abs)) if max_abs > 0 else 0
+    return int(min(max(0, needed), max(0, int(bits) - 1)))
+
+
+def weight_integer_bits(model: keras.Model, weights_bits: Dict[str, int]) -> Dict[str, int]:
+    """Per-layer integer bits for the weight/bias quantizers from the float weights of ``model``.
+
+    quantized_bits(b, I, alpha=1) covers [-2^I, 2^I) with step 2^(I + 1 - b). The default I = 2
+    (range +/-4) is wider than the trained weights (|W| up to ~2.3 in this network), so choosing
+    the smallest I that still covers max(|W_l|, |b_l|) of the reference model gives each layer
+    1 to 2 extra bits of resolution at the same bit width.
+    """
+    out = {}
+    for name, bits in weights_bits.items():
+        layer = model.get_layer(name)
+        max_abs = max(float(np.max(np.abs(w))) for w in layer.get_weights())
+        out[name] = range_integer_bits(max_abs, bits)
+    return out
 
 
 def build_compact_cnn1d_fp32(
@@ -53,6 +87,8 @@ def build_compact_qcnn1d(
     weights_bits: Optional[Dict[str, int]] = None,
     act_bits: Union[int, Dict[str, int]] = 8,
     learning_rate: float = 1e-3,
+    input_bits: Optional[int] = None,
+    weight_integer_bits: Optional[Dict[str, int]] = None,
 ) -> keras.Model:
     """Builds a simplified compact 1D CNN using QKeras with heterogeneous layer bitwidths (w_l, a_l).
 
@@ -62,8 +98,15 @@ def build_compact_qcnn1d(
         kernel_size: Size of 1D convolutional kernel.
         dense_units: Hidden units in QDense layer (n_2).
         weights_bits: Mapping from layer name to its integer weight bitwidth w_l.
-        act_bits: Global activation bitwidth (int) or per-layer dict {'conv1d_1': a_1, 'dense_1': a_2}.
+        act_bits: Global activation bitwidth (int) or per-layer dict {'conv1d_1': a_1, 'dense_1': a_2},
+            keyed by the layer whose ReLU output is quantized.
         learning_rate: Adam optimizer learning rate.
+        input_bits: If given, the input rings are quantized with
+            quantized_bits(input_bits, 0, keep_negative=False, alpha=1): unsigned, range [0, 1),
+            step 2^-input_bits. The L1-normalized rings are non-negative (at most ~0.74), so no
+            sign bit is needed. None keeps a floating-point input.
+        weight_integer_bits: Optional per-layer integer bits I_l of the weight/bias quantizers
+            (see weight_integer_bits); layers not listed use min(2, b - 1).
 
     Returns:
         Compiled QKeras Model ready for Quantization-Aware Training (QAT).
@@ -82,14 +125,23 @@ def build_compact_qcnn1d(
         a_conv = int(act_bits)
         a_dense = int(act_bits)
 
-    int_w_conv = min(2, max(0, b_conv - 1))
-    int_w_dense = min(2, max(0, b_dense - 1))
-    int_w_out = min(2, max(0, b_out - 1))
-    int_a_conv = min(2, max(0, a_conv - 1))
-    int_a_dense = min(2, max(0, a_dense - 1))
+    integer_map = weight_integer_bits or {}
+    int_w_conv = int(integer_map.get("conv1d_1", quantizer_integer_bits(b_conv)))
+    int_w_dense = int(integer_map.get("dense_1", quantizer_integer_bits(b_dense)))
+    int_w_out = int(integer_map.get("output_dense", quantizer_integer_bits(b_out)))
+    int_a_conv = quantizer_integer_bits(a_conv)
+    int_a_dense = quantizer_integer_bits(a_dense)
 
-    model = keras.Sequential([
-        keras.layers.Input(shape=(input_dim,), name="input_rings"),
+    input_layers = [keras.layers.Input(shape=(input_dim,), name="input_rings")]
+    if input_bits is not None:
+        input_layers.append(
+            QActivation(
+                quantized_bits(bits=int(input_bits), integer=0, keep_negative=False, alpha=1),
+                name="input_quant",
+            )
+        )
+
+    model = keras.Sequential(input_layers + [
         keras.layers.Reshape((input_dim, 1), name="reshape_1d"),
         QConv1D(
             filters=num_filters,

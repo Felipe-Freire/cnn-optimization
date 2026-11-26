@@ -63,26 +63,30 @@ Em vez de forçar quantização uniforme ($b_i = 8$ bits em todas as camadas), a
 
 ### 3.1 Modelo da Perturbação e Sensibilidade Hessiana
 
-Um quantizador uniforme simétrico de $b_i$ bits sobre o intervalo $[-r_i, r_i)$ possui passo de quantização:
+Os pesos e bias da camada $i$ são quantizados por `quantized_bits(b_i, I_i, alpha=1)` (`src/models.py`), de faixa fixa $[-2^{I_i}, 2^{I_i})$ e largura $\kappa_i = 2^{I_i+1}$. $I_i$ é o menor inteiro com $\max(|\mathbf{W}_i|, |\mathbf{b}_i|) \le 2^{I_i}$ no FP32 de *warm-start* (limitado a $b_i - 1$): os pesos treinados vão até ~2,3 em módulo, e a faixa padrão $\pm 4$ ($I = 2$) desperdiçaria 1 a 2 bits de resolução nas camadas de pesos menores. O passo é:
 
-$$\Delta_i = \frac{2 r_i}{2^{b_i}} = 2 r_i \cdot 2^{-b_i}$$
+$$\Delta_i = \kappa_i \cdot 2^{-b_i} = 2^{I_i + 1 - b_i}$$
 
 Sob a hipótese de ruído de arredondamento uniforme, a variância do erro de quantização de cada peso é $\sigma^2 = \frac{\Delta_i^2}{12}$. Para os $n_i$ parâmetros da camada $i$:
 
-$$\|\mathbf{W}_{q,i} - \mathbf{W}_i\|_2^2 \approx n_i \frac{\Delta_i^2}{12} = \frac{n_i r_i^2}{3} 2^{-2 b_i} = \frac{n_i r_i^2}{3} 4^{-b_i}$$
+$$\|\mathbf{W}_{q,i} - \mathbf{W}_i\|_2^2 \approx n_i \frac{\Delta_i^2}{12} = \frac{n_i \kappa_i^2}{12} 4^{-b_i}$$
 
-Pela expansão de Taylor de segunda ordem da função de perda $\mathcal{L}$ em torno do ponto de mínimo ($\nabla_{\mathbf{W}} \mathcal{L} \approx \mathbf{0}$):
+Pela expansão de Taylor de segunda ordem da função de perda $\mathcal{L}$ em torno do ponto de mínimo ($\nabla_{\mathbf{W}} \mathcal{L} \approx \mathbf{0}$), e como os erros de arredondamento de pesos diferentes são independentes e de média nula (só a diagonal de $\mathbf{H}$ contribui em média):
 
-$$\Delta \mathcal{L} \approx \frac{1}{2} \Delta \mathbf{W}^T \mathbf{H} \, \Delta \mathbf{W} \approx \sum_i \Omega_i(b_i)$$
+$$\Delta \mathcal{L} \approx \frac{1}{2} \Delta \mathbf{W}^T \mathbf{H} \, \Delta \mathbf{W} \approx \sum_i \frac{1}{2} \, \frac{\operatorname{Tr}(\mathbf{H}_i)}{n_i} \, \|\mathbf{W}_{q,i} - \mathbf{W}_i\|_2^2 = \sum_i \Omega_i(b_i)$$
 
-$$\Omega_i(b_i) \approx c_i 4^{-b_i}, \quad \text{onde } c_i = \operatorname{Tr}(\mathbf{H}_i) \frac{n_i r_i^2}{3}$$
+onde $\operatorname{Tr}(\mathbf{H}_i)$ é o traço **total** do bloco diagonal da camada (soma sobre os $n_i$ pesos) e $\operatorname{Tr}(\mathbf{H}_i)/n_i$ é a curvatura média, como em HAWQ-V2/V3 e Campos et al. O fator $n_i$ do erro cancela com o da curvatura média:
+
+$$\Omega_i(b_i) \approx c_i 4^{-b_i}, \quad \text{onde } c_i = \frac{\operatorname{Tr}(\mathbf{H}_i) \, \kappa_i^2}{24}$$
+
+A constante $\frac{1}{2}$ só muda a escala de $\Omega$ e do multiplicador $\lambda$; a alocação depende das razões $c_i / a_i$, e uma camada de faixa menor (menor $\kappa_i$) precisa de menos bits para o mesmo erro.
 
 #### Estimativa do Traço da Hessiana via Algoritmo de Hutchinson (HVP)
-Como calcular a matriz Hessiana completa $\mathbf{H} \in \mathbb{R}^{P \times P}$ é inviável, o traço $\operatorname{Tr}(\mathbf{H}_i)$ é estimado sem formar a matriz através de produtos Hessiana-vetor (HVP) com vetores aleatórios de Rademacher $\mathbf{z} \in \{-1, +1\}^P$:
+Como calcular a matriz Hessiana completa $\mathbf{H} \in \mathbb{R}^{P \times P}$ é inviável, o traço $\operatorname{Tr}(\mathbf{H}_i)$ é estimado sem formar a matriz através de produtos Hessiana-vetor (HVP) com vetores aleatórios de Rademacher $\mathbf{z} \in \{-1, +1\}^{n_i}$, sorteados para cada camada separadamente:
 
 $$\operatorname{Tr}(\mathbf{H}_i) \approx \frac{1}{M_H} \sum_{j=1}^{M_H} \mathbf{z}_j^T \left( \nabla^2_{\mathbf{W}_i} \mathcal{L} \, \mathbf{z}_j \right) = \frac{1}{M_H} \sum_{j=1}^{M_H} \mathbf{z}_j^T \nabla_{\mathbf{W}_i} \left( \nabla_{\mathbf{W}_i} \mathcal{L}^T \mathbf{z}_j \right)$$
 
-O cálculo de cada HVP requer apenas duas passagens de gradiente por diferenciação automática, sem custo quadrático de memória.
+O cálculo de cada HVP requer apenas duas passagens de gradiente por diferenciação automática, sem custo quadrático de memória. Um vetor único para todas as camadas somaria os termos cruzados $\mathbf{z}_i^T \mathbf{H}_{ik} \mathbf{z}_k$, de média nula mas com variância alta, o que pode tornar negativa a estimativa de uma camada pequena.
 
 ---
 
@@ -163,13 +167,25 @@ No contexto real de operação do trigger de Nível 0 (L0) do experimento ATLAS 
 
 Conforme a **Tabela 15 (*Virtex UltraScale+ FPGA Feature Summary*)** da documentação oficial da AMD/Xilinx, a capacidade total do dispositivo ($\mathbf{B}_{\text{chip}}$) e o orçamento fracionário dedicado a uma instância individual do classificador Ringer ($B_j = \alpha_j \cdot B_{j, \text{chip}}$, onde $\alpha_j \in (0, 1]$ representa a fração de área/recursos alocada ao núcleo neural) são definidos por:
 
-| Recurso Físico ($j$) | Capacidade Total da VU13P ($B_{j, \text{chip}}$) | Modelo de Consumo por Camada $l \in \{1, \dots, L\}$ |
-| :--- | :--- | :--- |
-| **DSP Slices** (`DSP`) | $12.288\text{ slices}$ | $\text{DSP}_l(w_l, a_l, n_l)$ — Alocado quando $w_l > 8$ ou $a_l > 8$ |
-| **CLB LUTs** (`LUT`) | $1.728.000\text{ LUTs}$ | $\text{LUT}_l(w_l, a_l, n_l) \approx \text{MAC}_l \cdot \frac{w_l \cdot a_l}{18}$ (quando $w_l \le 8, a_l \le 8$) |
-| **CLB Flip-Flops** (`FF`) | $3.456.000\text{ FFs}$ | $\text{FF}_l(w_l, a_l, n_l) \approx P_l \cdot w_l + N_{\text{out}, l} \cdot a_l$ |
-| **Block RAM** (`BRAM`) | $94,5\text{ Mb}$ ($2.688 \times 36\text{ Kb}$) | $\text{Bits}_l(w_l, n_l) = P_l \cdot w_l$ |
-| **UltraRAM** (`URAM`) | $360,0\text{ Mb}$ ($1.280 \times 288\text{ Kb}$) | Memória massiva unificada ($B_{\text{Mem}} = B_{\text{BRAM}} + B_{\text{URAM}}$) |
+| Recurso Físico ($j$) | Capacidade Total da VU13P ($B_{j, \text{chip}}$) |
+| :--- | :--- |
+| **DSP Slices** (`DSP`) | $12.288\text{ slices}$ |
+| **CLB LUTs** (`LUT`) | $1.728.000\text{ LUTs}$ |
+| **CLB Flip-Flops** (`FF`) | $3.456.000\text{ FFs}$ |
+| **Block RAM** (`BRAM`) | $94,5\text{ Mb}$ ($2.688 \times 36\text{ Kb}$) |
+| **UltraRAM** (`URAM`) | $360,0\text{ Mb}$ ($1.280 \times 288\text{ Kb}$) |
+
+**Orçamento da instância.** Uma única rede na VU13P, dividindo o chip com outros algoritmos do trigger. Cada recurso recebe no máximo $\alpha_j = 1\,\%$ do chip (17.280 LUTs, 34.560 FFs, 122 DSPs), dividido pela margem do modelo de custo, $B_j = \alpha_j B_{j,\text{chip}} / (1 + m_j)$ (`get_vu13p_budget(..., margins=CostModel.margins)`). Dentro desse teto, o objetivo é o menor consumo que preserva o SP e a latência.
+
+#### Modelo de consumo calibrado na síntese
+
+Com hls4ml em `io_parallel`, `Latency` e `ReuseFactor = 1`, os pesos são constantes embutidas na lógica. Multiplicar por uma constante é somar versões deslocadas da entrada: um peso nulo não custa nada, uma potência de 2 é só fio, e uma constante com $d$ dígitos não nulos em CSD (*canonical signed digit*) custa $d - 1$ somadores. Constantes largas ($\max(w_l, a_{\text{in},l}) > 10$) com 3 ou mais dígitos vão para um DSP48E2. Os pesos não ocupam BRAM; o único bloco de RAM é a tabela da sigmoide (1 RAMB18). Para a camada $l$ com $P_l$ posições em paralelo, fan-in $n_l$ e códigos inteiros $k$ dos pesos (`src/hardware.py`, `CostModel`):
+
+$$\text{somadores}_l = P_l \sum_{o} \Big[(\text{termos}_o - 1) + \sum_{k \in o} (\text{csd}(k) - 1)\Big], \qquad \text{bits}_l = \text{somadores}_l \Big(a_{\text{in},l} + w_l + \tfrac{1}{2}\lceil \log_2 n_l \rceil\Big)$$
+
+$$\text{LUT} = \beta_{\text{LUT}} \sum_l \text{bits}_l + \gamma_{\text{LUT}} \sum_l \text{ReLU}_l, \qquad \text{FF} = \beta_{\text{FF}} \sum_l \text{bits}_l + \delta_{\text{FF}} \, \text{DSP} + \gamma_{\text{FF}}$$
+
+onde $\text{ReLU}_l = P_l \, n^{\text{out}}_l (a_{\text{in},l} + w_l + \lceil \log_2 n_l \rceil)$ conta os bits de acumulador que entram na ReLU e no pooling. Os coeficientes são ajustados por mínimos quadrados na utilização pós-rota desta rede sintetizada (hls4ml → Vitis HLS → Vivado, `xcvu13p-flga2577-2-e`, 240 MHz; `src/calibration/vu13p_hls4ml_synthesis.json`, gerado pelo repositório `cnn-fpga-research`). Com 7 pontos no domínio, o erro de LUT deixando cada ponto fora do ajuste fica entre −14,9 % e +18,0 %; a pior subestimação de cada recurso é a margem $m_j$ (LUT 14,9 %, FF 21,7 %, DSP 20 %), contando só pontos com alavancagem < 0,9 no ajuste daquele recurso (o u16, único projeto com muitos DSPs, sozinho determina o FF por DSP e deixá-lo fora seria extrapolação). No teste fora da amostra da configuração escolhida (previsão congelada antes da síntese, `cnn-fpga-research`, rodada 3), o modelo previu 10.602 LUT, 3.794 FF e 0 DSP, e a síntese deu 9.442 LUT (+12 %), 4.848 FF (−22 %, no limite da margem) e 0 DSP. O modelo vale para `io_parallel`, `ReuseFactor = 1` e Conv1D totalmente paralela; fora disso são necessárias novas sínteses. Como o custo depende dos pesos treinados, a previsão antes do QAT usa os pesos FP32 quantizados (`make_cost_fn`) e a configuração final é recalculada com os pesos treinados.
 
 ### 4.1 Variáveis de Decisão e Função Objetivo Baseada no Índice-SP Existente
 
@@ -215,28 +231,33 @@ No ponto sela ótimo $(\mathbf{x}^*, \boldsymbol{\mu}^*)$, as quatro **Condiçõ
 4. **Folga Complementar (*Complementary Slackness*)**:
    $$\mu_j^* \cdot g_j(\mathbf{x}^*) = 0, \quad \forall j \in \{\text{DSP}, \text{LUT}, \text{FF}, \text{Mem}\}$$
 
-### 4.4 Algoritmo Iterativo Primal-Dual (Ascensão de Subgradiente Dual) e Critério de Parada
+### 4.4 Algoritmo Iterativo em Dois Níveis: Subproblema KKT no Envelope Convexo Contínuo e Bisseção Externa
 
-Para resolver o problema sobre o espaço discreto de larguras de bits $(w_l, a_l)$ e hiperparâmetros $n_l$:
-- **Passo Primal ($t$)**: Para $\boldsymbol{\mu}^{(t)}$ fixo, busca-se a configuração $\mathbf{x}^{(t)}$ que minimiza o custo Lagrangeano penalizado:
-  $$\mathcal{L}_{\text{pen}}(\mathbf{x}, \boldsymbol{\mu}^{(t)}) = (1 - SP_{\text{val}}(\mathbf{x})) + \sum_{j \in \mathcal{R}} \mu_j^{(t)} \max\left(0, \tilde{g}_j(\mathbf{x})\right)$$
-  (integrando também a alocação analítica de bits por sensibilidade Hessiana $\Omega(\mathbf{w}) = \sum_l c_l 4^{-w_l}$ ponderada pelos custos ativos $\sum_j \mu_j^{(t)} \frac{\partial g_j}{\partial w_l}$).
-- **Passo Dual ($t \to t+1$)**: Atualizam-se os multiplicadores de Lagrange via ascensão de subgradiente projetada no ortante não-negativo:
-  $$\mu_j^{(t+1)} = \max\left( 0, \, \mu_j^{(t)} + \eta_{\mu} \, \tilde{g}_j(\mathbf{x}^{(t)}) \right), \quad \forall j \in \mathcal{R}$$
-- **Critério de Parada KKT**: O loop primal-dual encerra quando simultaneamente:
-  1. **Convergência do Índice-SP**: $\left| SP^{(t)} - \frac{1}{m}\sum_{k=1}^m SP^{(t-k)} \right| < \epsilon_{\text{SP}}$;
-  2. **Viabilidade Primal Estrita**: $\tilde{g}_j(\mathbf{x}^{(t)}) \le 0, \, \forall j \in \mathcal{R}$;
-  3. **Folga Complementar KKT**: $\left| \mu_j^{(t)} \cdot \tilde{g}_j(\mathbf{x}^{(t)}) \right| < \epsilon_{\text{KKT}}, \, \forall j \in \mathcal{R}$.
+Com as ativações fixas, tanto a sensibilidade de quantização $\Omega(\mathbf{w}) = \sum_l c_l 4^{-w_l}$ (Seção 3, usada como substituto de $1 - SP$) quanto cada recurso do modelo calibrado de síntese (Seção 4) são aditivamente separáveis por camada:
+
+$$R_j(\mathbf{w}) = R_j(\mathbf{b}_{\min}) + \sum_{l=1}^{L} f_{jl}(w_l), \qquad f_{jl}(b_{\min}) = 0$$
+
+Como a contagem de somadores CSD no modelo calibrado é superlinear em $w_l$ (e pode ter pequenas ondulações não convexas locais), uma linearização por secante única $[b_{\min}, w_{\max}]$ superestima o custo no interior do domínio e pode violar a dualidade fraca frente ao problema inteiro. Em vez disso, para cada camada $l$ e recurso $j$, construímos o **envelope convexo inferior** (*lower convex hull*) $\hat{f}_{jl}(w)$ sobre os pontos inteiros $\{b_{\min}, \dots, w_{\max}\}$, obtendo uma função convexa linear por partes tal que $\hat{f}_{jl}(w) \le f_{jl}(w)$ em todo inteiro $w$ (no caso de modelo de custo analítico linear, $\hat{f}_{jl}$ reduz-se exatamente a um único segmento):
+
+$$\tilde{g}_j(\mathbf{w}) = \frac{R_j(\mathbf{b}_{\min}) - B_j}{\max(B_j, 1)} + \sum_{l=1}^{L} \frac{\hat{f}_{jl}(w_l)}{\max(B_j, 1)} \le 0, \qquad w_l \in [b_{\min}, w_{\max}]$$
+
+O subproblema relaxado resultante é **estritamente convexo** com restrições convexas (e contém todas as alocações inteiras viáveis sob o modelo real), logo satisfaz **Dualidade Fraca** ($q(\boldsymbol{\mu}^*) \le \Omega(\mathbf{w}_{\text{int}})$) e as condições KKT são necessárias e suficientes:
+
+- **Passo Primal (*Water-Filling* Analítico por Partes)**: para preços $\boldsymbol{\mu} \ge \mathbf{0}$ fixos, o Lagrangiano $\Omega(\mathbf{w}) + \sum_j \mu_j \tilde{g}_j(\mathbf{w})$ separa por camada. Em cada intervalo unitário $[k, k+1]$ com inclinação combinada não decrescente $\pi_{l,k} = \sum_j \mu_j \frac{\hat{f}_{jl}(k+1) - \hat{f}_{jl}(k)}{\max(B_j, 1)}$, a condição de estacionaridade por subdiferencial $0 \in -c_l \ln 4 \cdot 4^{-w_l^*} + \partial \phi_l(w_l^*; \boldsymbol{\mu}) - \nu_l^- + \nu_l^+$ fornece o minimizador único $w_l^*(\boldsymbol{\mu})$ em forma fechada (ou no interior de um segmento via $\frac{1}{2}\log_2 \frac{c_l \ln 4}{\pi_{l,k}}$, ou em um vértice inteiro $k$ da poligonal).
+- **Passo Dual**: como o primal é estritamente convexo, o minimizador $\mathbf{w}^*(\boldsymbol{\mu})$ é único e a função dual $q(\boldsymbol{\mu})$ é côncava e diferenciável com gradiente $\tilde{\mathbf{g}}(\mathbf{w}^*(\boldsymbol{\mu}))$. Os preços-sombra $\mu_j \ge 0$ são encontrados por ascensão projetada em $t_j = \log_2 \mu_j$ com amortecimento adaptativo por coordenada (`solve_relaxed_dual_envelope`), zerando ao final os multiplicadores de restrições inativas até valerem simultaneamente estacionaridade, viabilidade primal/dual e folga complementar $\mu_j^* \tilde{g}_j(\mathbf{w}^*) = 0$.
+- **Projeção Inteira Guiada pelo KKT**: a solução inteira $\mathbf{w}_{\text{int}}$ deriva diretamente de $\mathbf{w}^*(\boldsymbol{\mu}^*)$ sob o modelo de custo calibrado real (`compute_primal_bit_update`): inicia em $\lfloor \mathbf{w}^*(\boldsymbol{\mu}^*) \rfloor$ (com reparo de menor perda marginal se algum ponto acima do envelope exceder o orçamento), distribui a folga restante por passo guloso de eficiência marginal ponderada pelos preços-sombra $\boldsymbol{\mu}^*$ e aplica refinamento local por trocas unitárias $O(L^2)$. Como o envelope é uma relaxação válida, o *gap* de dualidade $\Omega(\mathbf{w}_{\text{int}}) - q(\boldsymbol{\mu}^*) \ge 0$ é sempre não negativo e certifica a qualidade da projeção inteira.
+- **Critério de Diagnóstico KKT**: em cada passo do laço externo, `check_kkt_stopping_criteria` registra a estabilização do Índice-$SP$, o resíduo de estacionaridade por subdiferencial, a viabilidade primal/dual e a folga complementar do subproblema KKT, além da viabilidade pós-QAT contra o teto real da instância VU13P.
 
 ---
 
 ## 5. Ciclo Fechado de Otimização em 3 Etapas (QKeras $\to$ SP/VU13P $\to$ Lagrange/KKT)
 
-O pipeline operacional unifica a teoria das Seções 1 a 4 em um ciclo fechado de três estágios iterativos:
+Objetivo do projeto: **o menor consumo de recursos que preserva o SP** do 8 bits uniforme (tolerância $\varepsilon_{SP} = 0{,}1$ p.p. na validação), dentro do teto da instância da Seção 4. A latência não entra como restrição: no domínio calibrado ela fica entre 9 e 12 ciclos (II = 1) e não cresce quando os bits caem.
 
-1. **Estágio 1 — Rede Neural Quantizada (QKeras)**:
-   - Configura as larguras de bits de pesos ($w_l$), ativações ($a_l$) e unidades ($n_l$) nas camadas `QConv1D` e `QDense`, aplicando transferência de pesos (*Warm-Start* QAT) a partir da referência em ponto flutuante e ajuste fino com decaimento adaptativo de taxa de aprendizado (`ReduceLROnPlateau`).
-2. **Estágio 2 — Avaliação de Desempenho Físico e Custo em Silício**:
-   - Avalia o **Índice-$SP$** no joelho da curva ROC de validação para computar a perda física $\mathcal{L}_{\text{SP}}(\mathbf{x}^{(t)}) = 1 - SP_{\text{val}}(\mathbf{x}^{(t)})$ e estima analiticamente o consumo de `DSP`, `LUT`, `FF` e `BRAM_bits` na FPGA **Virtex UltraScale+ VU13P**.
-3. **Estágio 3 — Núcleo de Otimização Lagrange / KKT**:
-   - Compara os recursos consumidos com os tetos de hardware $B_j$ ($g_j(\mathbf{x}^{(t)}) \le 0$), atualiza os **Preços de Sombra** ($\mu_j^{(t+1)}$) via subgradiente dual com projeção de folga complementar, verifica os critérios de parada KKT e calcula analiticamente a próxima alocação de bits $(w_l^{(t+1)}, a_l^{(t+1)})$ via condição de estacionaridade (*water-filling*).
+O SP só é conhecido depois do QAT, então o laço externo procura o menor orçamento de LUT $B$ cujo candidato gerado pelo subproblema KKT (Seção 4.4) ainda preserva o SP, por bisseção em $\log B$ entre o custo com todos os pesos em $b_{\min}$ e o teto. Em cada passo $t$:
+
+1. **Lagrange / KKT (envelope convexo contínuo)**: para $B^{(t)}$, `compute_primal_bit_update` constrói o envelope convexo inferior das curvas por camada no modelo calibrado (`make_cost_fn`, usando os pesos FP32), acha os preços-sombra $\mu_j$ por ascensão dual até as condições KKT exatas e projeta $\mathbf{w}^*(\boldsymbol{\mu}^*)$ para inteiros viáveis no modelo calibrado (com `duality_gap >= 0`);
+2. **QKeras**: o candidato é treinado com QAT a partir do FP32 (*warm-start*), com a mesma semente e o mesmo número de épocas que o 8 bits uniforme de referência;
+3. **SP e custo**: mede o $SP_{\text{val}}$ e recalcula os recursos com os pesos treinados. Se $SP_{\text{val}} \ge SP^{\text{8b}}_{\text{val}} - \varepsilon_{SP}$ e os recursos cabem no teto da instância VU13P, $B$ desce; senão, sobe.
+
+A configuração escolhida é a de menor LUT entre as aceitas. Como as diferenças de SP entre candidatos próximos são da ordem do ruído de um único treino, ela é confirmada por validação cruzada pareada: em cada um dos 5 folds, FP32, 8 bits uniforme e a alocação são treinados com os mesmos dados, a mesma semente e o mesmo *warm-start* (um FP32 treinado só com o treino do fold), e a alocação é aceita se a média de $SP^{\text{aloc}}_k - SP^{\text{8b}}_k$ for $\ge -\varepsilon_{SP}$; senão, testa-se o próximo candidato aceito. No holdout, cada modelo é avaliado no limiar escolhido na sua validação e relata-se a média dos folds. A execução é determinística (sementes fixas e `enable_op_determinism`).

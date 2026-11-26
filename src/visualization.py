@@ -511,13 +511,13 @@ def plot_vu13p_resource_utilization(
     title_prefix: str = "Virtex UltraScale+ VU13P",
     show: bool = False,
 ) -> str:
-    """Plots VU13P resource consumption (% of instance budget) and per-layer LUT/BRAM breakdown."""
+    """Plots VU13P resource consumption (% of instance budget) and the per-layer LUT breakdown."""
     set_academic_style()
     fig, axes = plt.subplots(1, 2, figsize=(14.5, 5.2))
 
-    # Panel 1: Resource Utilization (% of Instance Budget B_j) for LUT, FF, BRAM_bits
-    res_keys = ["LUT", "FF", "BRAM_bits"]
-    res_labels = ["CLB LUTs", "CLB Flip-Flops", "Block RAM [bits]"]
+    # Panel 1: Resource Utilization (% of Instance Budget B_j) for the constrained resources
+    res_keys = ["DSP", "LUT", "FF"]
+    res_labels = ["DSP48E2", "CLB LUTs", "CLB Flip-Flops"]
 
     u_8b = [hw_8bit["vu13p_resources"][k] / max(vu13p_budget[k], 1.0) * 100.0 for k in res_keys]
     u_kkt = [hw_kkt["vu13p_resources"][k] / max(vu13p_budget[k], 1.0) * 100.0 for k in res_keys]
@@ -525,8 +525,8 @@ def plot_vu13p_resource_utilization(
     x = np.arange(len(res_keys))
     width = 0.35
 
-    b1 = axes[0].bar(x - width / 2, u_8b, width, label="Uniforme 8-bit (Inviável em LUT/BRAM)", color="#a33030", alpha=0.8)
-    b2 = axes[0].bar(x + width / 2, u_kkt, width, label="Otimizado Lagrange/KKT (Viável ≤ 100%)", color="#1b9e77", alpha=0.85)
+    b1 = axes[0].bar(x - width / 2, u_8b, width, label="Uniforme 8-bit", color="#a33030", alpha=0.8)
+    b2 = axes[0].bar(x + width / 2, u_kkt, width, label="Alocação Lagrange/KKT", color="#1b9e77", alpha=0.85)
     axes[0].axhline(100.0, color="black", linestyle="--", lw=1.8, label="Limite de Orçamento VU13P (100%)")
 
     for bar in b1:
@@ -539,7 +539,7 @@ def plot_vu13p_resource_utilization(
     axes[0].set_xticks(x)
     axes[0].set_xticklabels(res_labels, fontweight="bold")
     axes[0].set_ylabel("Ocupação do Orçamento da Instância [%]")
-    axes[0].set_title(f"{title_prefix}: Uso de Recursos vs. Limites B_j (DSP = 0)", fontweight="bold")
+    axes[0].set_title(f"{title_prefix}: Uso de Recursos vs. Limites B_j", fontweight="bold")
     axes[0].set_ylim(0, max(max(u_8b), 115.0) * 1.15)
     axes[0].grid(True, linestyle=":", alpha=0.5, axis="y")
     axes[0].legend(loc="upper right")
@@ -548,7 +548,7 @@ def plot_vu13p_resource_utilization(
     layers = [item["layer_name"] for item in hw_kkt["breakdown"]]
     luts_8b = [item["LUT"] for item in hw_8bit["breakdown"]]
     luts_kkt = [item["LUT"] for item in hw_kkt["breakdown"]]
-    bit_labels = [f"{item['layer_name']}\n(w={item['b_w']}b, a={item['b_a']}b)" for item in hw_kkt["breakdown"]]
+    bit_labels = [f"{item['layer_name']}\n(w={item['b_w']}b, a_in={item['b_a']}b)" for item in hw_kkt["breakdown"]]
 
     x_l = np.arange(len(layers))
     b3 = axes[1].bar(x_l - width / 2, luts_8b, width, label="Uniforme (w=8b, a=8b)", color="#1f4e79", alpha=0.75)
@@ -598,23 +598,23 @@ def plot_primal_dual_kkt_evolution(
 
     fig, axes = plt.subplots(1, 3, figsize=(16.5, 4.8))
 
-    # 1. SP-Index & Lagrangian Objective Evolution
+    # 1. SP-Index & Dual Lagrangian Value Evolution
     ax1 = axes[0]
     ax1_twin = ax1.twinx()
     l1 = ax1.plot(iters, sp_vals, color="#1f4e79", marker="o", lw=2.2, label="Índice-SP Val [%]")
     l2 = ax1_twin.plot(
-        iters, lag_costs, color="#d95f02", marker="s", linestyle="--", lw=1.8, label="Custo Lagrangeano L(x, μ)"
+        iters, lag_costs, color="#d95f02", marker="s", linestyle="--", lw=1.8, label="Dual Lagrangeano q(μ*) [Ω]"
     )
     if conv_iters:
-        ax1.axvline(conv_iters[0], color="forestgreen", linestyle=":", lw=2.0, label=f"Convergência KKT (t={conv_iters[0]})")
-    ax1.set_title(f"{title_prefix}: Índice-SP vs. Iteração", fontweight="bold")
-    ax1.set_xlabel("Iteração Primal-Dual (t)")
+        ax1.axvline(conv_iters[0], color="forestgreen", linestyle=":", lw=2.0, label=f"KKT OK (t={conv_iters[0]})")
+    ax1.set_title(f"{title_prefix}: Índice-SP e Dual KKT", fontweight="bold")
+    ax1.set_xlabel("Passo da Bisseção de Orçamento (t)")
     ax1.set_ylabel("Índice-SP de Validação [%]", color="#1f4e79")
-    ax1_twin.set_ylabel("Custo Lagrangeano L(x, μ)", color="#d95f02")
+    ax1_twin.set_ylabel("Dual Lagrangeano q(μ*) [Ω]", color="#d95f02")
     ax1.grid(True, linestyle=":", alpha=0.5)
     lines = l1 + l2
     labels = [l.get_label() for l in lines]
-    ax1.legend(lines, labels, loc="center right")
+    ax1.legend(lines, labels, loc="lower right")
 
     # 2. Evolution of Lagrange Multipliers (Shadow Prices mu_j)
     ax2 = axes[1]
@@ -628,14 +628,14 @@ def plot_primal_dual_kkt_evolution(
             label=f"μ_{rk} (Preço de Sombra)",
         )
     if conv_iters:
-        ax2.axvline(conv_iters[0], color="forestgreen", linestyle=":", lw=2.0, label=f"Ótimo KKT (t={conv_iters[0]})")
-    ax2.set_title("Evolução dos Multiplicadores (μ_j) - VU13P", fontweight="bold")
-    ax2.set_xlabel("Iteração Primal-Dual (t)")
+        ax2.axvline(conv_iters[0], color="forestgreen", linestyle=":", lw=2.0, label=f"KKT OK (t={conv_iters[0]})")
+    ax2.set_title("Preços de Sombra KKT (μ_j) - VU13P", fontweight="bold")
+    ax2.set_xlabel("Passo da Bisseção de Orçamento (t)")
     ax2.set_ylabel("Multiplicador Dual (μ_j ≥ 0)")
     ax2.grid(True, linestyle=":", alpha=0.5)
     ax2.legend(loc="best")
 
-    # 3. Normalized Constraint Violations g_j(x) <= 0
+    # 3. Normalized Constraint Violations g_j(w*) <= 0
     ax3 = axes[2]
     ax3.axhline(0.0, color="crimson", linestyle="--", lw=1.8, label="Limite Viável (g_j = 0)")
     for rk in res_keys:
@@ -645,12 +645,12 @@ def plot_primal_dual_kkt_evolution(
             marker=markers.get(rk, "o"),
             color=colors.get(rk, "black"),
             lw=1.8,
-            label=f"g_{rk}(x) [%]",
+            label=f"g_{rk}(w*) [%]",
         )
     if conv_iters:
         ax3.axvline(conv_iters[0], color="forestgreen", linestyle=":", lw=2.0)
-    ax3.set_title("Viabilidade Primal das Restrições g_j(x) ≤ 0", fontweight="bold")
-    ax3.set_xlabel("Iteração Primal-Dual (t)")
+    ax3.set_title("Folga das Restrições KKT g_j(w*) ≤ 0", fontweight="bold")
+    ax3.set_xlabel("Passo da Bisseção de Orçamento (t)")
     ax3.set_ylabel("Excesso / Folga Relativa ao Orçamento [%]")
     ax3.grid(True, linestyle=":", alpha=0.5)
     ax3.legend(loc="best")

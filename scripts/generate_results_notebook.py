@@ -85,7 +85,7 @@ for layer_info in hw_q["breakdown"]:
         "MACs": layer_info["macs"],
         "Bits Contínuos (KKT)": round(kkt_meta["continuous_bits"][lname], 3),
         "Bits Pesos (w_l)": layer_info["b_w"],
-        "Bits Ativação (a_l)": layer_info["b_a"],
+        "Bits da Entrada (a_in)": layer_info["b_a"],
         "BOPs": layer_info["bops"],
         "VU13P DSP": int(layer_info.get("DSP", 0)),
         "VU13P LUT": round(float(layer_info.get("LUT", 0.0)), 1),
