@@ -25,6 +25,7 @@ Implementar um modelo simplificado de CNN1D voltada para futura implementação 
    - Monitoramento, função objetivo primal ($\mathcal{L}_{\text{SP}} = 1 - SP_{\text{val}}$) e *early stopping* guiados diretamente pelo **Índice Soma-Produto ($SP$)** no ponto de joelho (*knee*) da curva ROC;
    - Validação cruzada estratificada pareada ($K=5$ folds): FP32 de *warm-start* treinado por fold, FP32, 8 bits uniforme e a alocação nos mesmos folds; diferença pareada alocação − 8 bits de −0,05 ± 0,06 p.p. (erro padrão 0,03);
    - Holdout isolado ($20\%$) avaliado no limiar escolhido na validação de cada fold (média dos folds): alocação 97,69 %, 8 bits 97,73 %, FP32 97,71 %.
+   - Síntese do modelo exportado (`cnn-fpga-research`, `mp_w538`, VU13P a 240 MHz, pós-rota): **9.442 LUT** (40 % do 8 bits uniforme sintetizado), **4.848 FF**, **0 DSP**, 1 RAMB18, timing fechado, **11 ciclos (45,8 ns)** contra 12 do 8 bits, II = 1, SP da emulação C++ igual ao do QKeras.
 
 4. **Padronização Hierárquica de Artefatos (Padrão Jubiaba) e Suíte de Visualizações (`codeTCC` + `VU13P`)**:
    - Exportação estruturada em `<export_dir>/<dataset_prefix>/<model_name>/iet{iet}/ieta{ieta}/v{version}/` contendo `saved_models/` (`.keras` por fold e `.onnx`), `plots/`, `history/` (`.csv`/`.json`), `metadata/` (`.pkl`, `.json`, `.csv`) e `evaluation/` (`.npz`);
